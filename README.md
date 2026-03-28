@@ -34,6 +34,15 @@ Local-first AI trading desk for prediction markets. Built on [synthesis.trade](h
 └──────────────────────────────────────────────────┘
 ```
 
+## Documentation
+
+| Resource | Description |
+|----------|-------------|
+| [Getting Started](./docs/guides/getting-started.md) | Account → wallet → first order walkthrough |
+| [Authentication](./docs/guides/authentication.md) | Project keys, sessions, account API keys |
+| [WebSockets](./docs/guides/websockets.md) | Real-time balance, orderbook, trade streams |
+| [API Reference](./docs/api/reference.md) | Complete Synthesis API endpoint reference |
+
 ## Quick Start
 
 ```bash
