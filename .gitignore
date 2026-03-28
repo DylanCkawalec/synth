@@ -13,3 +13,6 @@ build/
 .ruff_cache/
 *.so
 .DS_Store
+data/
+feeds/
+*.jsonl
