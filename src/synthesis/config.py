@@ -12,6 +12,13 @@ class SynthesisSettings(BaseSettings):
     secret_key: str = Field(alias="SECRET_KEY_SYNTH")
     project_api_key: str | None = Field(default=None, alias="PROJECT_API_KEY")
 
+    # OpenAI
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
+
+    # NVIDIA (reserved for container / inference)
+    nvidia_key: str = Field(default="", alias="NVIDIA_KEY")
+
     # Endpoints
     base_url: str = "https://synthesis.trade/api/v1"
     ws_url: str = "wss://synthesis.trade/api/v1"
@@ -27,3 +34,10 @@ class SynthesisSettings(BaseSettings):
     max_daily_loss_usdc: float = 200.0
     max_open_positions: int = 20
     allowed_venues: list[str] = ["polymarket", "kalshi"]
+
+    # Approval gate
+    require_approval: bool = True
+    approval_ttl_seconds: int = 300
+
+    # Audit
+    audit_log_dir: str = "data"

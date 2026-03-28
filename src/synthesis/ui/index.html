@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Synth — AI Trading Desk</title>
+<style>
+:root{--bg:#0a0a0f;--bg2:#12121a;--bg3:#1a1a26;--border:#2a2a3a;--text:#e0e0ec;--dim:#6b6b80;--accent:#00d4aa;--accent2:#00b894;--warn:#ffb347;--danger:#ff6b6b;--blue:#5b9bd5;--purple:#a78bfa;font-family:'SF Mono','Fira Code',monospace;color-scheme:dark}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}
+button{cursor:pointer;font-family:inherit;font-size:12px;border:1px solid var(--border);background:var(--bg3);color:var(--text);padding:6px 14px;border-radius:4px;transition:all .15s}
+button:hover{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+button.danger:hover{background:var(--danger);border-color:var(--danger)}
+button.sm{padding:3px 8px;font-size:11px}
+input,textarea,select{font-family:inherit;font-size:13px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;outline:none;width:100%}
+input:focus,textarea:focus{border-color:var(--accent)}
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.badge.sim{background:#1a3a2a;color:var(--accent)}.badge.live{background:#3a1a1a;color:var(--danger)}
+.badge.pending{background:#3a3a1a;color:var(--warn)}.badge.approved{background:#1a3a2a;color:var(--accent)}
+.badge.rejected{background:#3a1a1a;color:var(--danger)}.badge.executed{background:#1a2a3a;color:var(--blue)}
+.badge.expired{background:var(--bg3);color:var(--dim)}
+.badge.read{background:#1a2a3a;color:var(--blue)}.badge.execute{background:#3a2a1a;color:var(--warn)}
+.badge.predict{background:#2a1a3a;color:var(--purple)}.badge.approve{background:#1a3a2a;color:var(--accent)}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--bg2);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+header h1{font-size:18px;font-weight:700;letter-spacing:1px}
+header h1 span{color:var(--accent)}
+.header-right{display:flex;align-items:center;gap:12px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);display:inline-block;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);background:var(--bg2);padding:0 20px}
+.tab{padding:10px 18px;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;transition:all .15s;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.tab:hover{color:var(--text)}.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+main{padding:20px;max-width:1400px;margin:0 auto}
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:16px}
+.panel h2{font-size:14px;color:var(--accent);margin-bottom:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+@media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
+
+.stat{text-align:center;padding:12px}
+.stat .val{font-size:24px;font-weight:700;color:var(--accent)}
+.stat .label{font-size:11px;color:var(--dim);margin-top:4px;text-transform:uppercase}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px;color:var(--dim);border-bottom:1px solid var(--border);font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+td{padding:8px;border-bottom:1px solid var(--border)}
+tr:hover td{background:rgba(0,212,170,.03)}
+.mono{font-family:'SF Mono','Fira Code',monospace}
+.truncate{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.confidence-bar{display:inline-block;height:6px;border-radius:3px;background:var(--accent);min-width:4px}
+
+.section{display:none}.section.active{display:block}
+.search-row{display:flex;gap:8px;margin-bottom:12px}
+.search-row input{flex:1}
+.prediction-card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:10px}
+.prediction-card h3{font-size:13px;margin-bottom:8px;color:var(--text)}
+.prediction-card .meta{display:flex;gap:16px;margin-bottom:8px;font-size:11px;color:var(--dim)}
+.prediction-card .field{margin-bottom:6px}.prediction-card .field-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.3px}
+.prediction-card .field-value{margin-top:2px}
+.empty{color:var(--dim);font-style:italic;padding:20px;text-align:center}
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;background:var(--bg3);border:1px solid var(--accent);border-radius:6px;color:var(--accent);font-size:12px;z-index:999;animation:fadeIn .3s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1><span>S</span>YNTH</h1>
+  <div class="header-right">
+    <span id="mode-badge" class="badge sim">SIM</span>
+    <span><span class="status-dot"></span> <span id="status-text">connecting</span></span>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="dashboard">Dashboard</div>
+  <div class="tab" data-tab="markets">Markets</div>
+  <div class="tab" data-tab="predictions">Predictions</div>
+  <div class="tab" data-tab="approvals">Approvals</div>
+  <div class="tab" data-tab="audit">Audit Log</div>
+  <div class="tab" data-tab="settings">Settings</div>
+</div>
+
+<main>
+<!-- Dashboard -->
+<div class="section active" id="sec-dashboard">
+  <div class="grid3" id="dash-stats">
+    <div class="panel"><div class="stat"><div class="val" id="s-balance">—</div><div class="label">Balance (USDC)</div></div></div>
+    <div class="panel"><div class="stat"><div class="val" id="s-positions">—</div><div class="label">Open Positions</div></div></div>
+    <div class="panel"><div class="stat"><div class="val" id="s-pnl">—</div><div class="label">Total P&L</div></div></div>
+  </div>
+  <div class="grid2">
+    <div class="panel">
+      <h2>Positions</h2>
+      <table><thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Price</th><th>P&L</th></tr></thead>
+      <tbody id="pos-table"><tr><td colspan="5" class="empty">Enter wallet ID in settings</td></tr></tbody></table>
+    </div>
+    <div class="panel">
+      <h2>Recent Predictions</h2>
+      <div id="dash-predictions"><div class="empty">No predictions yet</div></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Pending Approvals</h2>
+    <div id="dash-pending"><div class="empty">No pending actions</div></div>
+  </div>
+</div>
+
+<!-- Markets -->
+<div class="section" id="sec-markets">
+  <div class="panel">
+    <h2>Search Markets</h2>
+    <div class="search-row">
+      <input id="mkt-query" placeholder="bitcoin, election, fed rate…"/>
+      <select id="mkt-venue" style="width:140px"><option value="">All Venues</option><option value="polymarket">Polymarket</option><option value="kalshi">Kalshi</option></select>
+      <button onclick="searchMarkets()">Search</button>
+    </div>
+    <table><thead><tr><th>Market</th><th>Venue</th><th>Yes</th><th>No</th><th>Volume 24h</th><th>Liquidity</th><th>Action</th></tr></thead>
+    <tbody id="mkt-table"><tr><td colspan="7" class="empty">Search for markets above</td></tr></tbody></table>
+  </div>
+</div>
+
+<!-- Predictions -->
+<div class="section" id="sec-predictions">
+  <div class="panel">
+    <h2>Generate Prediction</h2>
+    <div class="search-row">
+      <input id="pred-query" placeholder="Will Bitcoin reach $100k by year end?"/>
+      <button onclick="generatePrediction()">Generate</button>
+    </div>
+    <div id="pred-loading" style="display:none" class="empty">Generating prediction…</div>
+  </div>
+  <div id="pred-list"></div>
+</div>
+
+<!-- Approvals -->
+<div class="section" id="sec-approvals">
+  <div class="panel">
+    <h2>Pending Actions</h2>
+    <div id="approval-pending"><div class="empty">No pending actions</div></div>
+  </div>
+  <div class="panel">
+    <h2>Approval History</h2>
+    <table><thead><tr><th>ID</th><th>Type</th><th>Status</th><th>Created</th><th>Resolved</th></tr></thead>
+    <tbody id="approval-history"><tr><td colspan="5" class="empty">No history</td></tr></tbody></table>
+  </div>
+</div>
+
+<!-- Audit -->
+<div class="section" id="sec-audit">
+  <div class="panel">
+    <h2>Audit Log</h2>
+    <div class="search-row">
+      <select id="audit-cat" style="width:140px"><option value="">All Categories</option><option value="read">Read</option><option value="execute">Execute</option><option value="predict">Predict</option><option value="approve">Approve</option><option value="admin">Admin</option></select>
+      <button onclick="loadAudit()">Refresh</button>
+    </div>
+    <table><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>Mode</th><th>Success</th><th>Details</th></tr></thead>
+    <tbody id="audit-table"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
+  </div>
+</div>
+
+<!-- Settings -->
+<div class="section" id="sec-settings">
+  <div class="grid2">
+    <div class="panel">
+      <h2>Wallet</h2>
+      <label style="font-size:11px;color:var(--dim);margin-bottom:4px;display:block">WALLET ID</label>
+      <div class="search-row">
+        <input id="cfg-wallet" placeholder="Enter your wallet ID"/>
+        <button onclick="saveWallet()">Save</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Desk Config</h2>
+      <div id="cfg-display"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Risk Limits</h2>
+    <div id="risk-display"></div>
+  </div>
+</div>
+</main>
+
+<script>
+const API='';
+let walletId=localStorage.getItem('synth_wallet')||'';
+let cfg={};
+
+async function api(path,opts){
+  try{const r=await fetch(API+path,opts);return await r.json();}
+  catch(e){return{success:false,error:e.message}}
+}
+function toast(msg){const d=document.createElement('div');d.className='toast';d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3000)}
+function fmtTime(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleTimeString()+' '+d.toLocaleDateString()}
+function shortId(id){return id?id.slice(0,8)+'…':'—'}
+
+// Tabs
+document.querySelectorAll('.tab').forEach(t=>{
+  t.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('sec-'+t.dataset.tab).classList.add('active');
+    if(t.dataset.tab==='audit')loadAudit();
+    if(t.dataset.tab==='approvals')loadApprovals();
+    if(t.dataset.tab==='predictions')loadPredictions();
+  });
+});
+
+// Dashboard
+async function loadDashboard(){
+  const h=await api('/health');
+  if(h.status==='ok'||h.simulation_mode!==undefined){
+    document.getElementById('status-text').textContent='connected';
+    const mb=document.getElementById('mode-badge');
+    if(h.simulation_mode){mb.textContent='SIM';mb.className='badge sim'}
+    else{mb.textContent='LIVE';mb.className='badge live'}
+  }
+  cfg=await api('/config');
+  if(walletId){
+    document.getElementById('cfg-wallet').value=walletId;
+    try{
+      const b=await api('/portfolio/balance/'+walletId);
+      if(b.success&&b.data)document.getElementById('s-balance').textContent=parseFloat(b.data.available||b.data.total||0).toFixed(2);
+      const p=await api('/portfolio/positions/'+walletId);
+      if(p.success&&p.data){
+        document.getElementById('s-positions').textContent=p.data.length;
+        const tb=document.getElementById('pos-table');
+        if(p.data.length)tb.innerHTML=p.data.map(x=>`<tr><td class="truncate">${x.title||x.token_id}</td><td>${x.side}</td><td>${x.size}</td><td>${x.current_price}</td><td>${x.pnl}</td></tr>`).join('');
+        else tb.innerHTML='<tr><td colspan="5" class="empty">No positions</td></tr>';
+      }
+      const pnl=await api('/portfolio/pnl/'+walletId);
+      if(pnl.success&&pnl.data)document.getElementById('s-pnl').textContent=parseFloat(pnl.data.total_pnl||0).toFixed(2);
+    }catch(e){}
+  }
+  loadPendingDash();
+  loadPredDash();
+  renderConfig();
+}
+
+async function loadPendingDash(){
+  const r=await api('/approvals/pending');
+  const c=document.getElementById('dash-pending');
+  if(r.success&&r.data&&r.data.length){
+    c.innerHTML=r.data.map(a=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;border-bottom:1px solid var(--border)">
+      <div><span class="badge pending">pending</span> <strong>${a.action_type}</strong> — ${JSON.stringify(a.params).slice(0,80)}</div>
+      <div><button class="sm" onclick="approveAction('${a.action_id}')">Approve</button> <button class="sm danger" onclick="rejectAction('${a.action_id}')">Reject</button></div>
+    </div>`).join('');
+  }else c.innerHTML='<div class="empty">No pending actions</div>';
+}
+
+async function loadPredDash(){
+  const r=await api('/predictions/history?limit=3');
+  const c=document.getElementById('dash-predictions');
+  if(r.success&&r.data&&r.data.length){
+    c.innerHTML=r.data.map(renderPredCard).join('');
+  }else c.innerHTML='<div class="empty">No predictions yet</div>';
+}
+
+function renderPredCard(p){
+  const confPct=(p.confidence*100).toFixed(0);
+  const confColor=p.confidence>.7?'var(--accent)':p.confidence>.4?'var(--warn)':'var(--danger)';
+  return `<div class="prediction-card">
+    <h3>${p.thesis}</h3>
+    <div class="meta">
+      <span>Confidence: <strong style="color:${confColor}">${confPct}%</strong> <span class="confidence-bar" style="width:${confPct}px;background:${confColor}"></span></span>
+      <span>${p.suggested_execution.action} ${p.suggested_execution.side} $${p.suggested_execution.amount_usdc}</span>
+      <span>${fmtTime(p.created_at)}</span>
+    </div>
+    <div class="field"><div class="field-label">Rationale</div><div class="field-value">${p.rationale}</div></div>
+    <div class="field"><div class="field-label">Invalidation</div><div class="field-value">${p.invalidation}</div></div>
+    <div class="field"><div class="field-label">Risk Note</div><div class="field-value">${p.risk_note}</div></div>
+  </div>`;
+}
+
+// Markets
+async function searchMarkets(){
+  const q=document.getElementById('mkt-query').value;
+  const v=document.getElementById('mkt-venue').value;
+  const r=await api(`/markets/search?query=${encodeURIComponent(q)}&venue=${v}&limit=20`);
+  const tb=document.getElementById('mkt-table');
+  if(r.success&&r.data&&r.data.length){
+    tb.innerHTML=r.data.map(m=>`<tr>
+      <td class="truncate">${m.event_title||''} — ${m.market_name||''}</td>
+      <td>${m.venue||''}</td>
+      <td>${m.yes_price}</td><td>${m.no_price}</td>
+      <td>${m.volume_24h}</td><td>${m.liquidity}</td>
+      <td><button class="sm" onclick="predictMarket('${(m.event_title||'').replace(/'/g,"\\'")}')">Predict</button></td>
+    </tr>`).join('');
+  }else tb.innerHTML='<tr><td colspan="7" class="empty">No results</td></tr>';
+}
+
+function predictMarket(q){
+  document.getElementById('pred-query').value=q;
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));
+  document.querySelector('[data-tab="predictions"]').classList.add('active');
+  document.getElementById('sec-predictions').classList.add('active');
+  generatePrediction();
+}
+
+// Predictions
+async function generatePrediction(){
+  const q=document.getElementById('pred-query').value;
+  if(!q)return;
+  document.getElementById('pred-loading').style.display='block';
+  const r=await api('/predictions/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,wallet_id:walletId||null})});
+  document.getElementById('pred-loading').style.display='none';
+  if(r.success&&r.data){toast('Prediction generated');loadPredictions();}
+  else toast('Error: '+(r.error||r.detail||'unknown'));
+}
+
+async function loadPredictions(){
+  const r=await api('/predictions/history?limit=20');
+  const c=document.getElementById('pred-list');
+  if(r.success&&r.data&&r.data.length)c.innerHTML=r.data.map(renderPredCard).join('');
+  else c.innerHTML='<div class="empty">No predictions yet. Generate one above.</div>';
+}
+
+// Approvals
+async function loadApprovals(){
+  const rp=await api('/approvals/pending');
+  const cp=document.getElementById('approval-pending');
+  if(rp.success&&rp.data&&rp.data.length){
+    cp.innerHTML=rp.data.map(a=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid var(--border)">
+      <div>
+        <span class="badge pending">pending</span> <strong>${a.action_type}</strong><br/>
+        <span style="font-size:11px;color:var(--dim)">${JSON.stringify(a.params)}</span>
+      </div>
+      <div><button onclick="approveAction('${a.action_id}')">Approve</button> <button class="danger" onclick="rejectAction('${a.action_id}')">Reject</button></div>
+    </div>`).join('');
+  }else cp.innerHTML='<div class="empty">No pending actions</div>';
+
+  const rh=await api('/approvals/history?limit=50');
+  const th=document.getElementById('approval-history');
+  if(rh.success&&rh.data&&rh.data.length){
+    th.innerHTML=rh.data.map(a=>`<tr><td class="mono">${shortId(a.action_id)}</td><td>${a.action_type}</td><td><span class="badge ${a.status}">${a.status}</span></td><td>${fmtTime(a.created_at)}</td><td>${fmtTime(a.resolved_at)}</td></tr>`).join('');
+  }else th.innerHTML='<tr><td colspan="5" class="empty">No history</td></tr>';
+}
+
+async function approveAction(id){
+  const r=await api(`/approvals/${id}/approve`,{method:'POST'});
+  if(r.success)toast('Approved: '+id.slice(0,8));
+  else toast('Error: '+(r.error||r.detail));
+  loadApprovals();loadPendingDash();
+}
+async function rejectAction(id){
+  const r=await api(`/approvals/${id}/reject`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'Operator rejected'})});
+  if(r.success)toast('Rejected: '+id.slice(0,8));
+  loadApprovals();loadPendingDash();
+}
+
+// Audit
+async function loadAudit(){
+  const cat=document.getElementById('audit-cat').value;
+  const r=await api(`/audit/query?limit=100${cat?'&category='+cat:''}`);
+  const tb=document.getElementById('audit-table');
+  if(r.success&&r.data&&r.data.length){
+    tb.innerHTML=r.data.map(e=>`<tr>
+      <td style="white-space:nowrap">${fmtTime(e.timestamp)}</td>
+      <td><span class="badge ${e.category}">${e.category}</span></td>
+      <td>${e.action}</td>
+      <td><span class="badge ${e.mode}">${e.mode}</span></td>
+      <td>${e.success?'✓':'✗'}</td>
+      <td class="truncate">${e.error||JSON.stringify(e.params).slice(0,60)}</td>
+    </tr>`).join('');
+  }else tb.innerHTML='<tr><td colspan="6" class="empty">No audit entries</td></tr>';
+}
+
+// Settings
+function saveWallet(){
+  walletId=document.getElementById('cfg-wallet').value.trim();
+  localStorage.setItem('synth_wallet',walletId);
+  toast('Wallet saved');loadDashboard();
+}
+
+function renderConfig(){
+  const c=document.getElementById('cfg-display');
+  if(cfg.simulation_mode!==undefined){
+    c.innerHTML=`<div style="font-size:12px;line-height:2">
+      Mode: <span class="badge ${cfg.simulation_mode?'sim':'live'}">${cfg.simulation_mode?'simulation':'live'}</span><br/>
+      Approval Required: <strong>${cfg.require_approval?'Yes':'No'}</strong><br/>
+      Max Position: <strong>$${cfg.max_position_usdc}</strong><br/>
+      Max Order: <strong>$${cfg.max_single_order_usdc}</strong><br/>
+      Max Daily Loss: <strong>$${cfg.max_daily_loss_usdc}</strong><br/>
+      Venues: <strong>${(cfg.allowed_venues||[]).join(', ')}</strong><br/>
+      Model: <strong>${cfg.openai_model||'—'}</strong>
+    </div>`;
+  }
+}
+
+// Init
+loadDashboard();
+setInterval(loadPendingDash,10000);
+</script>
+</body>
+</html>
