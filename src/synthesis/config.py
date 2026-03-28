@@ -35,9 +35,15 @@ class SynthesisSettings(BaseSettings):
     max_open_positions: int = 20
     allowed_venues: list[str] = ["polymarket", "kalshi"]
 
+    # AI / prediction thresholds
+    confidence_threshold: float = 0.55
+
     # Approval gate
     require_approval: bool = True
     approval_ttl_seconds: int = 300
 
     # Audit
     audit_log_dir: str = "data"
+
+    # Prediction persistence
+    prediction_log_dir: str = "data"

@@ -16,3 +16,11 @@ build/
 data/
 feeds/
 *.jsonl
+
+# Frontend
+app/node_modules/
+app/dist/
+src/synthesis/ui/dist/
+
+# MiroFish vendor (large, has own git)
+vendor/mirofish/.git/

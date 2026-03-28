@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from synthesis.config import SynthesisSettings
@@ -16,6 +17,8 @@ from synthesis.audit.logger import AuditLogger
 from synthesis.guard.gate import ApprovalGate
 from synthesis.predictions.engine import PredictionEngine
 
+logger = logging.getLogger("synth.deps")
+
 
 @dataclass
 class IslandRegistry:
@@ -28,6 +31,7 @@ class IslandRegistry:
     audit: AuditLogger
     gate: ApprovalGate
     predictions: PredictionEngine | None
+    ai_engine: object | None  # SynthAIEngine (optional, avoid hard import)
     settings: SynthesisSettings
 
 
@@ -45,6 +49,7 @@ def build_islands(settings: SynthesisSettings) -> IslandRegistry:
     market_discovery = MarketDiscoveryIsland(http)
 
     predictions: PredictionEngine | None = None
+    ai_engine = None
     if settings.openai_api_key:
         try:
             predictions = PredictionEngine(
@@ -53,6 +58,15 @@ def build_islands(settings: SynthesisSettings) -> IslandRegistry:
             )
         except ImportError:
             pass
+        try:
+            from synthesis.ai.engine import SynthAIEngine
+            ai_engine = SynthAIEngine(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                risk_config=risk_config,
+            )
+        except Exception as exc:
+            logger.warning("SynthAIEngine unavailable: %s", exc)
 
     return IslandRegistry(
         market_discovery=market_discovery,
@@ -67,5 +81,6 @@ def build_islands(settings: SynthesisSettings) -> IslandRegistry:
             ttl_seconds=settings.approval_ttl_seconds,
         ),
         predictions=predictions,
+        ai_engine=ai_engine,
         settings=settings,
     )
