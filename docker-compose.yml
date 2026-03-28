@@ -1,0 +1,18 @@
+services:
+  synth:
+    build: .
+    container_name: synth
+    ports:
+      - "8420:8420"
+    env_file: .env
+    environment:
+      - SERVER_HOST=0.0.0.0
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8420/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
