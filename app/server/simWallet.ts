@@ -1,4 +1,4 @@
-import { walletStore, type DbWallet } from './db.ts'
+import { walletStore, mintStore, type DbWallet } from './db.ts'
 
 const SIM_STARTING_BALANCE = parseFloat(process.env.SIM_STARTING_BALANCE || '10000')
 
@@ -57,6 +57,37 @@ export const simWallet = {
 
   reset(realWalletId: string): SimBalance {
     return this._set(realWalletId, SIM_STARTING_BALANCE)
+  },
+
+  // Returns today's date as YYYY-MM-DD in local time
+  _today(): string {
+    const d = new Date()
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  },
+
+  mintStatus(realWalletId: string): { canMint: boolean; mintedToday: number; remaining: number; resetAt: string } {
+    const today = this._today()
+    const minted = mintStore.todayTotal(realWalletId, today)
+    const MAX_DAILY = 1000
+    const remaining = Math.max(0, MAX_DAILY - minted)
+    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(0, 0, 0, 0)
+    return { canMint: remaining > 0, mintedToday: minted, remaining, resetAt: tomorrow.toISOString() }
+  },
+
+  mint(realWalletId: string, amount: number): { balance: SimBalance; minted: number; error?: string } {
+    const MAX_PER_MINT = 1000
+    const today = this._today()
+    const status = this.mintStatus(realWalletId)
+
+    if (amount <= 0) return { balance: this.get(realWalletId), minted: 0, error: 'Amount must be positive' }
+    if (amount > MAX_PER_MINT) return { balance: this.get(realWalletId), minted: 0, error: `Max $${MAX_PER_MINT} per mint` }
+    if (status.remaining <= 0) return { balance: this.get(realWalletId), minted: 0, error: `Daily limit reached. Resets at ${new Date(status.resetAt).toLocaleTimeString()}` }
+
+    const actualAmount = Math.min(amount, status.remaining)
+    const mintId = `mint_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    mintStore.record(mintId, realWalletId, actualAmount, today)
+    const balance = this.credit(realWalletId, actualAmount)
+    return { balance, minted: actualAmount }
   },
 
   _set(realWalletId: string, total: number): SimBalance {

@@ -1,4 +1,4 @@
-import type { Prediction, DualPrediction, Note, Wallet, Balance, Position, PNL, HealthStatus, DeskConfig, PendingAction, AuditEntry, AgentCommand, WalletMode, DepositAddress } from './types.ts'
+import type { Prediction, DualPrediction, Note, Wallet, Balance, Position, PNL, HealthStatus, DeskConfig, PendingAction, AuditEntry, AgentCommand, WalletMode, DepositAddress, OrderRequest, OrderQuote, OrderResult, MintStatus, MintResult, PricePoint, MarketStats } from './types.ts'
 
 async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json' }, ...opts })
@@ -13,7 +13,7 @@ export const getWallets     = ()              => api<{ wallets: Wallet[]; defaul
 export const getBalance     = (id: string, mode?: WalletMode) => api<Balance>(`/wallet/${id}/balance${mode ? `?mode=${mode}` : ''}`)
 export const getPositions   = (id: string)    => api<Position[]>(`/wallet/${id}/positions`)
 export const getPnl         = (id: string)    => api<PNL>(`/wallet/${id}/pnl`)
-export const getMarkets     = (q = '', v = '', n = 30) => api<unknown[]>(`/markets?query=${encodeURIComponent(q)}&venue=${v}&limit=${n}`)
+export const getMarkets     = (q = '', v = '', n = 40, days?: number) => api<unknown[]>(`/markets?query=${encodeURIComponent(q)}&venue=${v}&limit=${n}${days ? `&days=${days}` : ''}`)
 export const getPredictions = (n = 50, mode = 'both') => api<Prediction[]>(`/predictions?limit=${n}&mode=${mode}`)
 export const predict        = (query: string, walletId?: string, mode = 'both') =>
   api<DualPrediction>('/predict', { method: 'POST', body: JSON.stringify({ query, walletId, mode }) })
@@ -29,7 +29,10 @@ export const getNotes       = (tag?: string, period?: string, n = 50) => {
   if (period) p.set('period', period)
   return api<Note[]>(`/notes?${p}`)
 }
-export const getApprovals   = ()              => api<PendingAction[]>('/approvals')
+export const getApprovals   = (mode?: string, all = false) => api<PendingAction[]>(`/approvals${mode || all ? `?${mode ? `mode=${mode}&` : ''}${all ? 'all=true' : ''}` : ''}`)
+export const getPriceHistory = (tokenId: string, fidelity = 60) => api<{ history: PricePoint[] }>(`/market/${tokenId}/history?fidelity=${fidelity}`)
+export const getMarketStats  = (tokenId: string) => api<MarketStats>(`/market/${tokenId}/stats`)
+export const setHorizon     = (days: number) => api<{ horizonDays: number }>('/config/horizon', { method: 'POST', body: JSON.stringify({ days }) })
 export const approve        = (id: string)    => api(`/approvals/${id}/approve`, { method: 'POST' })
 export const reject         = (id: string, reason = '') => api(`/approvals/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) })
 export const getAudit       = (n = 100)       => api<AuditEntry[]>(`/audit?limit=${n}`)
@@ -39,6 +42,21 @@ export const getDepositAddress = (walletId: string, chainId: string, chain: stri
 
 export const requestWithdrawal = (walletId: string, params: { chain: string; token: string; amount: string; address: string }) =>
   api<{ success: boolean; txHash?: string }>(`/wallet/${walletId}/withdraw`, { method: 'POST', body: JSON.stringify(params) })
+
+export const quoteOrder = (walletId: string, params: Omit<OrderRequest, 'predictionId'>) =>
+  api<OrderQuote>(`/wallet/${walletId}/order/quote`, { method: 'POST', body: JSON.stringify(params) })
+
+export const placeOrder = (walletId: string, params: OrderRequest) =>
+  api<OrderResult>(`/wallet/${walletId}/order`, { method: 'POST', body: JSON.stringify(params) })
+
+export const setModel = (model: string) =>
+  api<{ model: string }>('/config/model', { method: 'POST', body: JSON.stringify({ model }) })
+
+export const getMintStatus = (walletId: string) =>
+  api<MintStatus>(`/wallet/${walletId}/sim/mint/status`)
+
+export const mintSimFunds = (walletId: string, amount: number) =>
+  api<MintResult>(`/wallet/${walletId}/sim/mint`, { method: 'POST', body: JSON.stringify({ amount }) })
 
 export async function chat(messages: Array<{ role: string; content: string }>): Promise<{ reply: string; commands: AgentCommand[] }> {
   return api('/chat', { method: 'POST', body: JSON.stringify({ messages }) })

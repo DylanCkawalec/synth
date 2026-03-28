@@ -1,9 +1,52 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
-import type { Tab, Prediction, ScoredMarket, Balance, Position, PNL, HealthStatus, DeskConfig, PendingAction, AuditEntry, ChatMessage, HighlightCommand, WalletMode, MetaMaskState, DepositAddress, Wallet, SupportedToken } from './types.ts'
+import type { Tab, Prediction, ScoredMarket, Balance, Position, PNL, HealthStatus, DeskConfig, PendingAction, AuditEntry, ChatMessage, HighlightCommand, WalletMode, MetaMaskState, MetaMaskToken, DepositAddress, Wallet, SupportedToken, MintStatus, PricePoint, ThinkCommand } from './types.ts'
 import { SUPPORTED_CHAINS, CHAIN_IDS, SUPPORTED_TOKENS } from './types.ts'
 import * as api from './api.ts'
 import { scoreMarkets } from './scoring.ts'
+
+// ── Celebration particle system ───────────────────────────────────
+type CelebType = 'fireworks' | 'confetti' | 'money'
+interface Particle { id: number; x: number; y: number; emoji: string; delay: number; dur: number; dx: number }
+const FIREWORK_EMOJIS = ['🎆','🎇','✨','💥','⭐','🌟','💫']
+const CONFETTI_EMOJIS  = ['🎊','🎉','🥳','🏆','⭐','💰','🎈','🥂']
+const MONEY_EMOJIS     = ['💵','💸','💴','💶','💷','🪙','💎']
+
+function makeParticles(count: number, emojis: string[]): Particle[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: i, x: Math.random() * 100, y: Math.random() * 30,
+    emoji: emojis[Math.floor(Math.random() * emojis.length)],
+    delay: Math.random() * 1.2, dur: 1.5 + Math.random() * 1.5,
+    dx: (Math.random() - 0.5) * 200,
+  }))
+}
+
+function Celebration({ type, onDone }: { type: CelebType; onDone: () => void }) {
+  const emojis = type === 'fireworks' ? FIREWORK_EMOJIS : type === 'confetti' ? CONFETTI_EMOJIS : MONEY_EMOJIS
+  const count  = type === 'money' ? 18 : 30
+  const particles = useMemo(() => makeParticles(count, emojis), [count, emojis])
+  const isDown = type !== 'money'
+
+  useEffect(() => {
+    const t = setTimeout(onDone, 3800)
+    return () => clearTimeout(t)
+  }, [onDone])
+
+  return (
+    <div className="fixed inset-0 pointer-events-none z-[999] overflow-hidden">
+      {particles.map(p => (
+        <span key={p.id} className="absolute text-2xl select-none"
+          style={{
+            left: `${p.x}%`, top: isDown ? `${p.y}%` : '90%',
+            animation: `${isDown ? 'celebFall' : 'celebRise'} ${p.dur}s ease-out ${p.delay}s both`,
+            '--dx': `${p.dx}px`,
+          } as React.CSSProperties}>
+          {p.emoji}
+        </span>
+      ))}
+    </div>
+  )
+}
 
 // ── Formatters ────────────────────────────────────────────────────
 const f = (n: string | number, d = 2) => { const v = typeof n === 'string' ? parseFloat(n) : n; return isNaN(v) ? '—' : v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }) }
@@ -16,18 +59,83 @@ function truncAddr(addr: string, n = 6) { return addr ? `${addr.slice(0, n)}...$
 function isValidEvmAddress(addr: string) { return /^0x[a-fA-F0-9]{40}$/.test(addr) }
 function isValidSolAddress(addr: string) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr) }
 
-// ── MetaMask helpers ─────────────────────────────────────────────
-async function connectMetaMask(): Promise<MetaMaskState> {
-  const eth = (window as { ethereum?: { request: (args: { method: string; params?: unknown[] }) => Promise<unknown>; on: (event: string, cb: (...args: unknown[]) => void) => void } }).ethereum
-  if (!eth) throw new Error('MetaMask not detected. Please install MetaMask.')
+// ── Wallet connection helpers (MetaMask / Phantom / any EIP-1193) ──
+type EthProvider = { request: (args: { method: string; params?: unknown[] }) => Promise<unknown>; on: (event: string, cb: (...args: unknown[]) => void) => void; removeListener: (event: string, cb: (...args: unknown[]) => void) => void }
+
+function getEthProvider(): EthProvider | null {
+  const w = window as { ethereum?: EthProvider; phantom?: { ethereum?: EthProvider } }
+  return w.ethereum || w.phantom?.ethereum || null
+}
+
+const USDC_CONTRACTS: Record<number, string> = {
+  137: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',  // Polygon USDC
+  1:   '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',  // Ethereum USDC
+  8453:'0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',  // Base USDC
+  42161:'0xaf88d065e77c8cC2239327C5EDb3A432268e5831', // Arbitrum USDC
+  10:  '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',  // Optimism USDC
+}
+
+async function connectExternalWallet(): Promise<MetaMaskState> {
+  const eth = getEthProvider()
+  if (!eth) throw new Error('No wallet detected. Install MetaMask or Phantom.')
+
   const accounts = await eth.request({ method: 'eth_requestAccounts' }) as string[]
+  if (!accounts || accounts.length === 0) throw new Error('No accounts returned. Unlock your wallet and try again.')
+
+  const address = accounts[0]
   const chainHex = await eth.request({ method: 'eth_chainId' }) as string
   const chainId = parseInt(chainHex, 16)
-  const address = accounts[0]
-  const balHex = await eth.request({ method: 'eth_getBalance', params: [address, 'latest'] }) as string
-  const balance = (parseInt(balHex, 16) / 1e18).toFixed(4)
-  return { connected: true, address, chainId, chainName: CHAIN_IDS[chainId] || `Chain ${chainId}`, balance, supportedTokens: [] }
+
+  let ethBalance = '0'
+  try {
+    const balHex = await eth.request({ method: 'eth_getBalance', params: [address, 'latest'] }) as string
+    ethBalance = (parseInt(balHex, 16) / 1e18).toFixed(4)
+  } catch { /* non-fatal */ }
+
+  const tokens: MetaMaskToken[] = []
+  const usdcAddr = USDC_CONTRACTS[chainId]
+  if (usdcAddr) {
+    try {
+      const balData = await eth.request({
+        method: 'eth_call',
+        params: [{ to: usdcAddr, data: `0x70a08231000000000000000000000000${address.slice(2)}` }, 'latest'],
+      }) as string
+      const usdcBal = (parseInt(balData, 16) / 1e6).toFixed(2)
+      tokens.push({ symbol: 'USDC', balance: usdcBal, contract: usdcAddr, canDeposit: true })
+    } catch { /* non-fatal */ }
+  }
+
+  return {
+    connected: true, address, chainId,
+    chainName: CHAIN_IDS[chainId] || `Chain ${chainId}`,
+    balance: ethBalance,
+    supportedTokens: tokens,
+  }
 }
+
+// ── Sparkline SVG ─────────────────────────────────────────────────
+function Sparkline({ points, width = 120, height = 32, color = '#00ffb4' }: { points: PricePoint[]; width?: number; height?: number; color?: string }) {
+  if (!points || points.length < 2) return <span className="text-[10px] text-s-muted">No chart data</span>
+  const min = Math.min(...points.map(p => p.p)); const max = Math.max(...points.map(p => p.p))
+  const range = max - min || 0.01
+  const xs = points.map((_, i) => (i / (points.length - 1)) * width)
+  const ys = points.map(p => height - ((p.p - min) / range) * (height - 4) - 2)
+  const d = xs.map((x, i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ')
+  const fill = `${d} L${width},${height} L0,${height} Z`
+  const trend = points[points.length-1].p - points[0].p
+  const trendColor = trend >= 0 ? '#00ffb4' : '#ff4d6d'
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="overflow-visible">
+      <path d={fill} fill={`${trendColor}18`} stroke="none" />
+      <path d={d} fill="none" stroke={color} strokeWidth="1.5" />
+      <circle cx={xs[xs.length-1]} cy={ys[ys.length-1]} r="2.5" fill={trendColor} />
+    </svg>
+  )
+}
+
+// Stage icons for NemoClaw thinking
+const STAGE_ICONS: Record<string, string> = { observe: '👁', orient: '🧭', research: '🔍', analyze: '📊', decide: '⚡', act: '🎯' }
+const STAGE_COLORS: Record<string, string> = { observe: 'text-s-blue', orient: 'text-s-accent', research: 'text-purple-400', analyze: 'text-yellow-400', decide: 'text-s-warn', act: 'text-s-green' }
 
 // ── Main App ──────────────────────────────────────────────────────
 export default function App() {
@@ -55,6 +163,27 @@ export default function App() {
   const [chatLoading, setChatLoading] = useState(false)
   const [autoMode, setAutoMode] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
+
+  // Celebrations
+  const [celebration, setCelebration] = useState<CelebType | null>(null)
+  const triggerCelebration = useCallback((type: CelebType) => {
+    setCelebration(type)
+  }, [])
+
+  // Think messages from NemoClaw
+  const [thinkLog, setThinkLog] = useState<ThinkCommand[]>([])
+
+  // Price history cache per tokenId
+  const [priceHistories, setPriceHistories] = useState<Record<string, PricePoint[]>>({})
+  const [loadingHistory, setLoadingHistory] = useState<string | null>(null)
+
+  // Approvals filter
+  const [approvalFilter, setApprovalFilter] = useState<'all' | 'live' | 'sim'>('all')
+
+  // Sim mint
+  const [mintStatus, setMintStatus] = useState<MintStatus | null>(null)
+  const [mintAmount, setMintAmount] = useState('100')
+  const [mintLoading, setMintLoading] = useState(false)
 
   // Highlights
   const [highlights, setHighlights] = useState<Map<string, string>>(new Map())
@@ -100,11 +229,12 @@ export default function App() {
       try { setPos(await api.getPositions(wid)) } catch {/**/}
       try { setPnl(await api.getPnl(wid)) } catch {/**/}
     }
-    try { setPreds(await api.getPredictions(50)) } catch {/**/}
+    try { setPreds(await api.getPredictions(100)) } catch {/**/}
     try { setPending(await api.getApprovals()) } catch {/**/}
-    try { setMkts(scoreMarkets(await api.getMarkets('', '', 40) as Record<string, unknown>[])) } catch {/**/}
+    const days = config?.horizonDays || 7
+    try { setMkts(scoreMarkets(await api.getMarkets('', '', 40, days) as Record<string, unknown>[])) } catch {/**/}
     setLastRefresh(Date.now())
-  }, [wid, wMode])
+  }, [wid, wMode, config?.horizonDays])
 
   useEffect(() => { refresh() }, [refresh])
   useEffect(() => { const iv = setInterval(refresh, 12_000); return () => clearInterval(iv) }, [refresh])
@@ -117,7 +247,16 @@ export default function App() {
   }
 
   const resolve = async (id: string, correct: boolean) => {
-    try { await api.resolvePrediction(id, correct); await refresh(); flash(correct ? 'Marked correct' : 'Marked incorrect') }
+    try {
+      await api.resolvePrediction(id, correct)
+      await refresh()
+      if (correct) {
+        flash('🏆 Prediction correct! Well done.')
+        triggerCelebration('confetti')
+      } else {
+        flash('Marked incorrect — keep learning.')
+      }
+    }
     catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Failed'}`) }
   }
 
@@ -125,6 +264,91 @@ export default function App() {
     try { await api.deletePrediction(id); setPreds(prev => prev.filter(p => p.id !== id)); flash('Prediction removed') }
     catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Failed'}`) }
   }
+
+  const [orderLoading, setOrderLoading] = useState<string | null>(null)
+
+  const placeOrder = async (p: Prediction, amountOverride?: number) => {
+    if (!wid || !p.tokenId) { flash('Missing wallet or token ID'); return }
+    setOrderLoading(p.id)
+    try {
+      const amount = String(amountOverride ?? p.amountUsdc)
+      const result = await api.placeOrder(wid, {
+        predictionId: p.id,
+        tokenId: p.tokenId,
+        side: (p.side as 'BUY' | 'SELL') || 'BUY',
+        type: (p.orderType as 'MARKET' | 'LIMIT') || 'MARKET',
+        amount,
+        units: 'USDC',
+        venue: (p.venue?.toLowerCase().includes('kalshi') ? 'kalshi' : 'polymarket') as 'polymarket' | 'kalshi',
+      })
+      if ('queued' in result) {
+        flash('Order queued for approval — check Approvals tab')
+        setTab('approvals')
+      } else {
+        flash(`🎆 Position filled: ${result.orderId?.slice(0, 12)}...`)
+        triggerCelebration('fireworks')
+        await refresh()
+      }
+    } catch (e) { flash(`Order failed: ${e instanceof Error ? e.message : 'Unknown'}`) }
+    finally { setOrderLoading(null) }
+  }
+
+  const changeModel = async (model: string) => {
+    try { await api.setModel(model); setConfig(prev => prev ? { ...prev, model } : prev); flash(`Model → ${model}`) }
+    catch (e) { flash(`Failed: ${e instanceof Error ? e.message : ''}`) }
+  }
+
+  const changeHorizon = async (days: number) => {
+    try {
+      await api.setHorizon(days)
+      setConfig(prev => prev ? { ...prev, horizonDays: days } : prev)
+      await refresh()
+      flash(`Horizon → ${days}d`)
+    } catch (e) { flash(`Failed: ${e instanceof Error ? e.message : ''}`) }
+  }
+
+  const loadPriceHistory = useCallback(async (tokenId: string) => {
+    if (!tokenId || priceHistories[tokenId] || loadingHistory === tokenId) return
+    setLoadingHistory(tokenId)
+    try {
+      const result = await api.getPriceHistory(tokenId, 60) as Record<string, unknown>
+      // Handle various API response shapes: {history:[...]}, {ohlc:[...]}, or direct array
+      let pts: PricePoint[] = []
+      if (Array.isArray((result as { history?: unknown }).history)) {
+        pts = (result as { history: PricePoint[] }).history
+      } else if (Array.isArray((result as { ohlc?: unknown }).ohlc)) {
+        pts = ((result as { ohlc: Array<{ time: number; close: number }> }).ohlc)
+          .map(c => ({ t: c.time * 1000, p: c.close }))
+      } else if (Array.isArray(result)) {
+        pts = result as PricePoint[]
+      }
+      setPriceHistories(prev => ({ ...prev, [tokenId]: pts }))
+    } catch { /* non-fatal */ }
+    finally { setLoadingHistory(null) }
+  }, [priceHistories, loadingHistory])
+
+  const handleMint = async () => {
+    if (!wid || mintLoading) return
+    setMintLoading(true)
+    try {
+      const amount = parseFloat(mintAmount) || 0
+      if (amount <= 0 || amount > 1000) { flash('Enter an amount between $1 and $1,000'); return }
+      const result = await api.mintSimFunds(wid, amount)
+      if (result.error) { flash(result.error); return }
+      setMintStatus(result.status)
+      setBal(await api.getBalance(wid, 'sim'))
+      triggerCelebration('money')
+      flash(`💵 +$${result.minted.toFixed(2)} added to practice wallet!`)
+    } catch (e) { flash(`Mint failed: ${e instanceof Error ? e.message : ''}`) }
+    finally { setMintLoading(false) }
+  }
+
+  // Load mint status when in sim mode
+  useEffect(() => {
+    if (wid && wMode === 'sim') {
+      api.getMintStatus(wid).then(setMintStatus).catch(() => {})
+    }
+  }, [wid, wMode])
 
   const confLabel = (c: number) => {
     const pct = Math.round(c * 100)
@@ -148,12 +372,16 @@ export default function App() {
     setChatInput('')
     setChatLoading(true)
     try {
+      setThinkLog([])
       const { reply, commands } = await api.chat(newMsgs.map(m => ({ role: m.role, content: m.content })))
-      setChatMsgs(prev => [...prev, { role: 'assistant', content: reply || 'Done.' }])
+      const thinks: ThinkCommand[] = []
       for (const cmd of commands || []) {
         if (cmd.type === 'switch_tab') setTab(cmd.payload as Tab)
         if (cmd.type === 'highlight') addHighlight(cmd.payload as HighlightCommand)
+        if (cmd.type === 'think') thinks.push(cmd.payload as ThinkCommand)
       }
+      setThinkLog(thinks)
+      setChatMsgs(prev => [...prev, { role: 'assistant', content: reply || 'Done.' }])
       await refresh()
     } catch (e) { setChatMsgs(prev => [...prev, { role: 'assistant', content: `Error: ${e instanceof Error ? e.message : 'Failed'}` }]) }
     finally { setChatLoading(false) }
@@ -170,22 +398,21 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoMode])
 
-  // MetaMask connection
-  const handleConnectMetaMask = async () => {
+  const handleConnectWallet = async () => {
     try {
-      const state = await connectMetaMask()
+      const state = await connectExternalWallet()
       setMetaMask(state)
       if (state.address) setWithdrawAddress(state.address)
-      flash('MetaMask connected')
-    } catch (e) { flash(e instanceof Error ? e.message : 'MetaMask connection failed') }
+      const usdcBal = state.supportedTokens.find(t => t.symbol === 'USDC')
+      flash(`Wallet connected${usdcBal ? ` — ${usdcBal.balance} USDC` : ''}`)
+    } catch (e) { flash(e instanceof Error ? e.message : 'Wallet connection failed') }
   }
 
-  // Listen for MetaMask chain/account changes
   useEffect(() => {
-    const eth = (window as { ethereum?: { on: (event: string, cb: (...args: unknown[]) => void) => void; removeListener: (event: string, cb: (...args: unknown[]) => void) => void } }).ethereum
+    const eth = getEthProvider()
     if (!eth) return
-    const handleChainChange = () => { if (metaMask.connected) handleConnectMetaMask() }
-    const handleAccountChange = () => { if (metaMask.connected) handleConnectMetaMask() }
+    const handleChainChange = () => { if (metaMask.connected) handleConnectWallet() }
+    const handleAccountChange = () => { if (metaMask.connected) handleConnectWallet() }
     eth.on('chainChanged', handleChainChange)
     eth.on('accountsChanged', handleAccountChange)
     return () => {
@@ -247,15 +474,42 @@ export default function App() {
   const [lastRefresh, setLastRefresh] = useState(Date.now())
   const refreshAge = Math.round((Date.now() - lastRefresh) / 1000)
 
-  // Deduplicate: one card per market name, latest wins
+  // Deduplicate: one card per market name per day, latest wins
+  // Then sort: affordable+uncommitted first (actionable now), then committed, then others
   const dedupedPreds = useMemo(() => {
     const seen = new Map<string, Prediction>()
     for (const p of preds) {
-      const key = p.marketName || p.query
+      const dayKey = p.createdAt.slice(0, 10)
+      const key = `${p.marketName || p.query}::${dayKey}`
       if (!seen.has(key)) seen.set(key, p)
     }
-    return [...seen.values()]
+    const all = [...seen.values()]
+    return all.sort((a, b) => {
+      // Committed (active positions) come first for tracking
+      const aCommitted = !!(a.status === 'committed' || a.orderId)
+      const bCommitted = !!(b.status === 'committed' || b.orderId)
+      if (aCommitted !== bCommitted) return aCommitted ? -1 : 1
+      // Then sort by affordability × confidence
+      const aAfford = (a.maxAffordableUsdc || 0) >= (a.minEntryUsdc || 0.10) && a.status !== 'resolved'
+      const bAfford = (b.maxAffordableUsdc || 0) >= (b.minEntryUsdc || 0.10) && b.status !== 'resolved'
+      if (aAfford !== bAfford) return aAfford ? -1 : 1
+      return b.confidence - a.confidence
+    })
   }, [preds])
+
+  // Group by dateLabel for section headers
+  const groupedPreds = useMemo(() => {
+    const groups: Record<string, Prediction[]> = { today: [], yesterday: [], this_week: [], older: [] }
+    for (const p of dedupedPreds) {
+      const lbl = p.dateLabel || 'older'
+      groups[lbl].push(p)
+    }
+    return groups
+  }, [dedupedPreds])
+
+  const GROUP_LABELS: Record<string, string> = {
+    today: 'Today', yesterday: 'Yesterday', this_week: 'This Week', older: 'Older',
+  }
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
@@ -287,6 +541,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col font-sans text-[13px]">
+      {celebration && <Celebration type={celebration} onDone={() => setCelebration(null)} />}
       {/* Header */}
       <header className="flex items-center justify-between px-5 h-12 bg-s-surface border-b border-s-border sticky top-0 z-50">
         <div className="flex items-center gap-3">
@@ -297,7 +552,11 @@ export default function App() {
             <button key={t} onClick={() => { setTab(t); if (t === 'audit') api.getAudit().then(setAudit).catch(() => {}) }}
               className={`px-3 py-1.5 rounded text-xs transition-all duration-200 ${tab === t ? 'text-s-accent bg-s-panel border-b-2 border-s-accent' : 'text-s-muted hover:text-s-text hover:bg-s-panel/50'}`}>
               {t.charAt(0).toUpperCase() + t.slice(1)}
-              {t === 'approvals' && pending.length > 0 && <span className="ml-1 bg-s-danger text-white text-[9px] px-1.5 rounded-full font-bold">{pending.length}</span>}
+              {t === 'approvals' && (pending.length > 0 || (health as (HealthStatus & { pendingApprovals?: number }))?.pendingApprovals) && (
+                <span className="ml-1 bg-s-danger text-white text-[9px] px-1.5 rounded-full font-bold">
+                  {(health as (HealthStatus & { pendingApprovals?: number }))?.pendingApprovals || pending.length}
+                </span>
+              )}
               {t === 'predictions' && preds.length > 0 && <span className="ml-1 bg-s-blue text-white text-[9px] px-1.5 rounded-full font-bold">{preds.length}</span>}
             </button>
           ))}
@@ -516,66 +775,149 @@ export default function App() {
                 </div>
               </div>
               <div className="space-y-3">
-                {dedupedPreds.map(p => {
+                {(['today', 'yesterday', 'this_week', 'older'] as const).flatMap(group =>
+                  groupedPreds[group].length === 0 ? [] : [
+                    <div key={`hdr-${group}`} className="flex items-center gap-2 pt-1">
+                      <span className="text-[10px] font-bold text-s-muted uppercase tracking-widest">{GROUP_LABELS[group]}</span>
+                      <span className="flex-1 h-px bg-s-border" />
+                      <span className="text-[10px] text-s-muted">{groupedPreds[group].length}</span>
+                    </div>,
+                    ...groupedPreds[group].map(p => {
                   const cl = confLabel(p.confidence)
                   const ended = marketEnded(p.endsAt)
-                  const isBuyOrSell = p.action === 'BUY' || p.action === 'SELL'
                   const isExpanded = expanded.has(p.id)
-                  const effectiveAction = (p.action === 'HOLD' || p.action === 'SKIP') ? p.action : `${p.action} ${p.side || 'YES'}`
+                  const isCommitted = p.status === 'committed' || p.orderId
+                  const leanPrice = p.lean === 'YES' ? p.yesPrice : p.lean === 'NO' ? p.noPrice : p.yesPrice
+                  const canAfford = (p.maxAffordableUsdc || 0) >= (p.minEntryUsdc || 0.10)
+                  const isOrdering = orderLoading === p.id
                   return (
-                  <div key={p.id} className="bg-s-panel border border-s-border rounded-lg overflow-hidden">
+                  <div key={p.id} className={`bg-s-panel border rounded-lg overflow-hidden ${isCommitted ? 'border-yellow-400/50 shadow-[0_0_12px_rgba(250,204,21,0.15)]' : 'border-s-border'}`}>
                     {/* Header */}
                     <div className="flex items-center gap-2 p-4 pb-3">
+                      {isCommitted && <span className="text-yellow-400 text-xs" title="You have money on this">💰</span>}
                       <span className="text-sm font-semibold flex-1">{p.marketName || p.query}</span>
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted uppercase">{p.venue || '—'}</span>
                       <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${cl.cls}`}>{cl.text}</span>
                       <button onClick={() => deletePred(p.id)} title="Remove this prediction" className="text-s-muted hover:text-s-danger text-xs px-1">✕</button>
                     </div>
 
-                    {/* AI Recommendation */}
-                    <div className={`mx-4 mb-3 p-3 rounded-lg border ${isBuyOrSell ? 'border-s-accent/30 bg-s-accent/5' : 'border-s-border bg-s-elevated/50'}`}>
-                      <div className="text-xs font-semibold mb-1">
-                        {isBuyOrSell ? (
-                          <span>AI recommends: <span className={p.action === 'BUY' ? 'text-s-green' : 'text-s-danger'}>{effectiveAction}</span> at <span className="font-mono">${f(p.yesPrice)}</span></span>
-                        ) : (
-                          <span className="text-s-muted">AI recommends: <span className="text-s-warn">{p.action}</span> — confidence too low or insufficient data</span>
-                        )}
+                    {/* AI Lean + Recommendation */}
+                    <div className="mx-4 mb-3 p-3 rounded-lg border border-s-accent/30 bg-s-accent/5">
+                      {p.lean && (
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className={`text-sm font-black px-2 py-0.5 rounded ${p.lean === 'YES' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>
+                            {p.lean}
+                          </span>
+                          <span className="text-xs text-s-muted flex-1">{p.leanReason || p.thesis}</span>
+                        </div>
+                      )}
+                      <div className="text-xs font-semibold">
+                        AI recommends: <span className="text-s-green">{p.action} {p.lean || 'YES'}</span> at <span className="font-mono">${f(leanPrice)}</span>
+                        {p.amountUsdc > 0 && <span className="text-s-muted ml-1">— wager <span className="font-mono text-s-text">${f(p.amountUsdc)}</span></span>}
                       </div>
-                      {isBuyOrSell && p.amountUsdc > 0 && (
-                        <div className="text-[11px] text-s-muted">Suggested wager: <span className="font-mono font-semibold text-s-text">${f(p.amountUsdc)}</span></div>
+                      {p.kellyFraction != null && p.kellyFraction > 0 && (
+                        <div className="text-[10px] text-s-muted mt-1">Kelly fraction: {(p.kellyFraction * 100).toFixed(1)}%</div>
                       )}
                     </div>
 
-                    {/* Bet buttons */}
-                    {isBuyOrSell && !ended && p.status !== 'resolved' && (
+                    {/* Position info: min entry, max affordable */}
+                    {!ended && !isCommitted && (
+                      <div className="mx-4 mb-3 flex gap-4 text-[10px]">
+                        <div className="flex items-center gap-1">
+                          <span className="text-s-muted">Min entry:</span>
+                          <span className="font-mono font-semibold">${f(p.minEntryUsdc || 0.10)}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-s-muted">You can bet up to:</span>
+                          <span className={`font-mono font-semibold ${canAfford ? 'text-s-green' : 'text-s-danger'}`}>${f(p.maxAffordableUsdc || 0)}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-s-muted">Yes:</span>
+                          <span className="font-mono">${f(p.yesPrice)}</span>
+                          <span className="text-s-muted ml-1">No:</span>
+                          <span className="font-mono">${f(p.noPrice)}</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Order buttons */}
+                    {!ended && p.status !== 'resolved' && !isCommitted && (
                       <div className="flex gap-2 mx-4 mb-3">
-                        <button title="Place a simulated bet with practice money"
-                          className="flex-1 px-3 py-2 bg-s-green/20 text-s-green border border-s-green/30 rounded text-xs font-bold hover:bg-s-green/30 transition-all">
-                          Simulate Bet ${f(p.amountUsdc)}
-                        </button>
-                        {wMode === 'real' && (
-                          <button title="Place a real bet (requires approval)"
-                            className="flex-1 px-3 py-2 bg-transparent text-s-warn border border-s-warn/40 rounded text-xs font-bold hover:bg-s-warn/10 transition-all">
-                            Place Real Bet ${f(p.amountUsdc)}
+                        {wMode === 'sim' ? (
+                          <button onClick={() => placeOrder(p)} disabled={isOrdering}
+                            title="Place a simulated bet with practice money"
+                            className="flex-1 px-3 py-2.5 bg-s-green/20 text-s-green border border-s-green/30 rounded text-xs font-bold hover:bg-s-green/30 transition-all disabled:opacity-50">
+                            {isOrdering ? 'Placing...' : `Simulate: ${p.lean || 'YES'} $${f(p.amountUsdc)}`}
                           </button>
+                        ) : (
+                          <>
+                            <button onClick={() => placeOrder(p)} disabled={isOrdering || !canAfford}
+                              title={canAfford ? 'Place a real order via synthesis.trade' : 'Insufficient balance'}
+                              className="flex-1 px-3 py-2.5 bg-s-accent/20 text-s-accent border border-s-accent/30 rounded text-xs font-bold hover:bg-s-accent/30 transition-all disabled:opacity-50">
+                              {isOrdering ? 'Placing...' : `Commit: ${p.lean || 'YES'} $${f(p.amountUsdc)}`}
+                            </button>
+                            {p.amountUsdc > 1 && (
+                              <button onClick={() => placeOrder(p, Math.max(p.minEntryUsdc || 0.10, 1))} disabled={isOrdering}
+                                title="Place minimum bet"
+                                className="px-3 py-2.5 bg-s-elevated text-s-muted border border-s-border rounded text-xs font-semibold hover:text-s-text transition-all disabled:opacity-50">
+                                Min ${ f(Math.max(p.minEntryUsdc || 0.10, 1))}
+                              </button>
+                            )}
+                          </>
                         )}
                       </div>
                     )}
 
-                    {/* Thesis (collapsible) */}
+                    {/* Committed status */}
+                    {isCommitted && (
+                      <div className="mx-4 mb-3 p-2.5 rounded-lg border border-yellow-400/30 bg-yellow-400/5">
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="text-yellow-400 font-bold">COMMITTED</span>
+                          {p.orderId && <span className="text-[10px] text-s-muted font-mono">{p.orderId.slice(0, 16)}...</span>}
+                          {p.orderStatus && <span className="text-[10px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted">{p.orderStatus}</span>}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Analysis (collapsible) — includes sparkline + real stats */}
                     <div className="mx-4 mb-3">
-                      <button onClick={() => setExpanded(prev => { const n = new Set(prev); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n })}
-                        className="text-[10px] text-s-muted hover:text-s-text transition-colors">
-                        {isExpanded ? '▾ Hide analysis' : '▸ Show analysis'}
+                      <button onClick={() => {
+                        setExpanded(prev => { const n = new Set(prev); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n })
+                        if (!expanded.has(p.id) && p.tokenId) loadPriceHistory(p.tokenId)
+                      }} className="text-[10px] text-s-muted hover:text-s-text transition-colors">
+                        {isExpanded ? '▾ Hide analysis' : '▸ Show analysis + chart'}
                       </button>
                       {isExpanded && (
-                        <div className="mt-2 space-y-2 text-xs">
+                        <div className="mt-2 space-y-3 text-xs">
+                          {/* Price chart */}
+                          {p.tokenId && (
+                            <div className="bg-s-elevated/50 rounded-lg p-3 border border-s-border/50">
+                              <div className="flex items-center justify-between mb-2">
+                                <span className="text-[10px] font-bold text-s-muted uppercase">Price History (YES)</span>
+                                <div className="flex gap-3 text-[10px] font-mono">
+                                  <span>Yes: <strong className="text-s-green">${f(p.yesPrice)}</strong></span>
+                                  <span>No: <strong className="text-s-danger">${f(p.noPrice)}</strong></span>
+                                  {p.kellyFraction != null && p.kellyFraction > 0 && (
+                                    <span className="text-s-accent">Kelly {(p.kellyFraction * 100).toFixed(1)}%</span>
+                                  )}
+                                </div>
+                              </div>
+                              {loadingHistory === p.tokenId ? (
+                                <div className="text-[10px] text-s-muted animate-pulse">Loading chart...</div>
+                              ) : priceHistories[p.tokenId] ? (
+                                <Sparkline points={priceHistories[p.tokenId]} width={300} height={48} />
+                              ) : (
+                                <button onClick={() => loadPriceHistory(p.tokenId)} className="text-[10px] text-s-accent underline">Load chart</button>
+                              )}
+                            </div>
+                          )}
                           <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Thesis</strong><p className="text-s-muted mt-0.5">{p.thesis}</p></div>
                           <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Rationale</strong><p className="text-s-muted mt-0.5">{p.rationale}</p></div>
                           <div className="grid grid-cols-2 gap-3">
                             <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Invalidation</strong><p className="text-s-muted mt-0.5">{p.invalidation}</p></div>
                             <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Risk</strong><p className="text-s-muted mt-0.5">{p.riskNote}</p></div>
                           </div>
+                          {p.model && <div className="text-[10px] text-s-muted">Model: {p.model} | Token: <span className="font-mono">{p.tokenId?.slice(0, 16)}...</span></div>}
                         </div>
                       )}
                     </div>
@@ -589,18 +931,19 @@ export default function App() {
                       )}
                       <span className="text-s-muted ml-auto">{ago(p.createdAt)}</span>
 
-                      {/* Correct/Wrong only after market ends */}
                       {ended && p.status !== 'resolved' && (
                         <div className="flex gap-1.5">
-                          <button onClick={() => resolve(p.id, true)} title="Mark this prediction as correct" className="px-2.5 py-1 bg-s-green/20 text-s-green rounded text-[10px] font-bold hover:bg-s-green/30">✓ Correct</button>
-                          <button onClick={() => resolve(p.id, false)} title="Mark this prediction as incorrect" className="px-2.5 py-1 bg-s-danger/20 text-s-danger rounded text-[10px] font-bold hover:bg-s-danger/30">✗ Wrong</button>
+                          <button onClick={() => resolve(p.id, true)} title="Mark correct" className="px-2.5 py-1 bg-s-green/20 text-s-green rounded text-[10px] font-bold hover:bg-s-green/30">✓ Correct</button>
+                          <button onClick={() => resolve(p.id, false)} title="Mark incorrect" className="px-2.5 py-1 bg-s-danger/20 text-s-danger rounded text-[10px] font-bold hover:bg-s-danger/30">✗ Wrong</button>
                         </div>
                       )}
                       {p.wasCorrect !== null && <span className={`font-bold ${p.wasCorrect ? 'text-s-green' : 'text-s-danger'}`}>{p.wasCorrect ? '✓ AI was right' : '✗ AI was wrong'}</span>}
                     </div>
                   </div>
                   )
-                })}
+                }),
+                  ]
+                )}
                 {dedupedPreds.length === 0 && <p className="text-s-muted text-xs text-center py-8">No predictions yet. Ask NemoClaw or search above.</p>}
               </div>
             </div>
@@ -609,17 +952,63 @@ export default function App() {
           {/* ── APPROVALS ── */}
           {tab === 'approvals' && (
             <div className="bg-s-surface border border-s-border rounded-lg p-4">
-              <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Approval Queue</h2>
-              {pending.length === 0 ? <p className="text-s-muted text-xs">All clear</p> : pending.map(a => (
-                <div key={a.id} className="border border-s-border rounded p-3 mb-2">
-                  <div className="flex items-center gap-3 mb-2"><span className="font-semibold text-xs">{a.type}</span><span className="text-[10px] text-s-muted">{a.id.slice(0, 8)}</span><span className="text-[10px] text-s-muted">{ago(a.createdAt)}</span></div>
-                  <pre className="text-[10px] text-s-muted bg-s-bg rounded p-2 mb-2 overflow-x-auto max-h-24">{JSON.stringify(a.params, null, 2)}</pre>
-                  <div className="flex gap-2">
-                    <button onClick={() => { api.approve(a.id).then(refresh).catch(() => {}); flash('Approved') }} className="px-3 py-1 bg-s-green text-black font-semibold rounded text-xs">Approve</button>
-                    <button onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }} className="px-3 py-1 bg-s-danger text-white font-semibold rounded text-xs">Reject</button>
-                  </div>
+              <div className="flex items-center gap-3 mb-4">
+                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Approval Queue</h2>
+                <div className="flex gap-1 bg-s-elevated rounded-lg p-0.5">
+                  {(['all','live','sim'] as const).map(f => (
+                    <button key={f} onClick={() => { setApprovalFilter(f); api.getApprovals(f === 'all' ? undefined : f).then(setPending).catch(() => {}) }}
+                      className={`px-2.5 py-1 rounded text-[10px] font-semibold transition-all ${approvalFilter === f ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text'}`}>
+                      {f.toUpperCase()}
+                    </button>
+                  ))}
                 </div>
-              ))}
+                <button onClick={() => api.getApprovals(approvalFilter === 'all' ? undefined : approvalFilter).then(setPending).catch(() => {})}
+                  className="ml-auto text-[10px] text-s-muted hover:text-s-accent">↻ Refresh</button>
+              </div>
+
+              <div className="mb-2 text-[10px] text-s-muted">
+                <strong>Predictions tab</strong> = your AI analyses and generated trade ideas.<br/>
+                <strong>Approvals tab</strong> = live orders waiting for your confirmation before real money is spent.
+              </div>
+
+              {pending.length === 0 ? (
+                <div className="text-center py-8">
+                  <p className="text-s-muted text-xs">No pending orders.</p>
+                  <p className="text-[10px] text-s-muted mt-1">When you click "Commit" in LIVE mode, orders appear here for approval before executing.</p>
+                </div>
+              ) : pending.map(a => {
+                const p = a.params as { tokenId?: string; side?: string; amount?: string; orderType?: string; predictionId?: string }
+                const isLive = a.mode === 'real'
+                return (
+                  <div key={a.id} className={`border rounded-lg p-3 mb-2 ${isLive ? 'border-s-warn/40 bg-s-warn/5' : 'border-s-border'}`}>
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${isLive ? 'bg-s-warn/20 text-s-warn' : 'bg-s-elevated text-s-muted'}`}>{isLive ? 'LIVE ORDER' : 'SIM'}</span>
+                      <span className="text-xs font-semibold">{p.side} {p.amount} USDC</span>
+                      <span className="text-[10px] text-s-muted font-mono">{p.tokenId?.slice(0, 16)}...</span>
+                      <span className="text-[10px] text-s-muted ml-auto">{ago(a.createdAt)}</span>
+                    </div>
+                    <div className="flex gap-2 text-[10px] text-s-muted mb-2">
+                      <span>Type: {p.orderType || 'MARKET'}</span>
+                      {p.predictionId && <span>Linked to prediction: {p.predictionId}</span>}
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => {
+                        api.approve(a.id).then(r => {
+                          if ('orderResult' in (r as object)) { triggerCelebration('fireworks'); flash('🎆 Order executed!') }
+                          else flash('Approved')
+                          refresh()
+                        }).catch(e => flash(`Error: ${e instanceof Error ? e.message : ''}`))
+                      }} className="px-3 py-1.5 bg-s-green text-black font-bold rounded text-xs hover:brightness-110">
+                        {isLive ? '✓ Execute Order' : '✓ Approve'}
+                      </button>
+                      <button onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }}
+                        className="px-3 py-1.5 bg-s-danger/20 text-s-danger border border-s-danger/30 rounded text-xs font-semibold">
+                        ✗ Cancel
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           )}
 
@@ -694,7 +1083,8 @@ export default function App() {
                   </div>
 
                   <div className="bg-s-surface border border-s-border rounded-lg p-4">
-                    <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">MetaMask</h2>
+                    <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">External Wallet</h2>
+                    <p className="text-[10px] text-s-muted mb-3">For deposits and withdrawals only. Your Synthesis wallet handles trading.</p>
                     {metaMask.connected ? (
                       <div className="space-y-3">
                         <div className="flex items-center gap-2">
@@ -705,7 +1095,8 @@ export default function App() {
                           {[
                             ['Address', truncAddr(metaMask.address || '', 10)],
                             ['Network', metaMask.chainName || `Chain ${metaMask.chainId}`],
-                            ['Balance', `${metaMask.balance} ETH`],
+                            ['ETH', `${metaMask.balance}`],
+                            ...(metaMask.supportedTokens || []).map(t => [t.symbol, `${t.balance}`] as [string, string]),
                           ].map(([k, v]) => (
                             <div key={k} className="flex justify-between py-1 border-b border-s-border/50 text-xs">
                               <span className="text-s-muted">{k}</span>
@@ -713,16 +1104,16 @@ export default function App() {
                             </div>
                           ))}
                         </div>
-                        <button onClick={handleConnectMetaMask} className="w-full px-3 py-2 bg-s-elevated text-s-muted rounded text-xs hover:text-s-text">
-                          Refresh Connection
+                        <button onClick={handleConnectWallet} className="w-full px-3 py-2 bg-s-elevated text-s-muted rounded text-xs hover:text-s-text">
+                          Refresh
                         </button>
                       </div>
                     ) : (
                       <div className="text-center py-6">
-                        <p className="text-s-muted text-xs mb-3">Connect MetaMask for direct deposits and withdrawals</p>
-                        <button onClick={handleConnectMetaMask}
+                        <p className="text-s-muted text-xs mb-3">Connect MetaMask or Phantom for deposits and withdrawals</p>
+                        <button onClick={handleConnectWallet}
                           className="px-5 py-2.5 bg-s-accent text-black font-bold rounded text-xs hover:brightness-110">
-                          Connect MetaMask
+                          Connect Wallet
                         </button>
                       </div>
                     )}
@@ -933,9 +1324,34 @@ export default function App() {
                   <div className="bg-s-surface border border-s-border rounded-lg p-4">
                     <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Desk Configuration</h2>
                     {config && <div className="space-y-0.5">
+                      {/* Time horizon selector */}
+                      <div className="flex justify-between items-center py-2 border-b border-s-border/50">
+                        <div>
+                          <span className="text-[11px] text-s-muted">Market Horizon</span>
+                          <p className="text-[10px] text-s-muted/60">Only show markets ending within this window</p>
+                        </div>
+                        <div className="flex gap-1">
+                          {[7, 14, 30, 60, 90].map(d => (
+                            <button key={d} onClick={() => changeHorizon(d)}
+                              className={`text-[10px] px-2 py-1 rounded font-semibold transition-all ${config?.horizonDays === d ? 'bg-s-accent text-black' : 'bg-s-elevated text-s-muted hover:text-s-text'}`}>
+                              {d}d
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {/* Model selector */}
+                      <div className="flex justify-between items-center py-2 border-b border-s-border/50">
+                        <span className="text-[11px] text-s-muted">AI Model</span>
+                        <div className="relative">
+                          <select value={config.model} onChange={e => changeModel(e.target.value)}
+                            className="bg-s-bg border border-s-border rounded px-2 py-1 text-xs text-s-text appearance-none cursor-pointer focus:border-s-accent outline-none pr-6">
+                            {(config.availableModels || ['gpt-4o']).map((m: string) => <option key={m} value={m}>{m}</option>)}
+                          </select>
+                          <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-s-muted text-[10px]">▾</span>
+                        </div>
+                      </div>
                       {[
                         ['Mode', wMode === 'sim' ? 'Practice' : 'Live'],
-                        ['Model', config.model],
                         ['Confidence Threshold', String(config.confidenceThreshold)],
                         ['Require Approval', config.requireApproval ? 'Yes' : 'No'],
                         ['Max Position', `$${config.risk.maxPositionUsdc}`],
@@ -951,6 +1367,53 @@ export default function App() {
                       ))}
                     </div>}
                   </div>
+                  {/* Sim wallet mint — only in practice mode */}
+                  {wMode === 'sim' && (
+                    <div className="bg-s-surface border border-s-border rounded-lg p-4 lg:col-span-2">
+                      <div className="flex items-center justify-between mb-3">
+                        <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Practice Wallet — Add Funds</h2>
+                        {mintStatus && (
+                          <span className="text-[10px] text-s-muted">
+                            Minted today: <span className="font-mono font-semibold">${mintStatus.mintedToday.toFixed(2)}</span>
+                            {' '}/ $1,000 limit
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex gap-2 items-end mb-3">
+                        <div className="flex-1">
+                          <label className="text-[10px] text-s-muted uppercase tracking-wider block mb-1.5">Amount (max $1,000/day)</label>
+                          <div className="flex items-center gap-2 bg-s-bg border border-s-border rounded px-3 py-2">
+                            <span className="text-s-muted text-xs">$</span>
+                            <input type="number" min="1" max="1000" step="1" value={mintAmount}
+                              onChange={e => setMintAmount(e.target.value)}
+                              className="flex-1 bg-transparent text-xs text-s-text outline-none" placeholder="100" />
+                            {[100, 250, 500, 1000].map(v => (
+                              <button key={v} onClick={() => setMintAmount(String(v))}
+                                className="text-[10px] text-s-muted hover:text-s-accent font-semibold">${v}</button>
+                            ))}
+                          </div>
+                        </div>
+                        <button onClick={handleMint} disabled={mintLoading || !mintStatus?.canMint}
+                          title={mintStatus?.canMint ? 'Add practice funds' : `Daily limit reached. Resets ${mintStatus ? new Date(mintStatus.resetAt).toLocaleTimeString() : ''}`}
+                          className="px-4 py-2.5 bg-s-green text-black font-bold rounded text-xs hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                          style={{ animation: mintStatus?.canMint ? 'mintPop 0.4s ease-out' : undefined }}>
+                          {mintLoading ? 'Minting...' : mintStatus?.canMint ? `💵 Mint $${mintAmount}` : 'Limit Reached'}
+                        </button>
+                      </div>
+                      {mintStatus && !mintStatus.canMint && (
+                        <p className="text-[10px] text-s-warn">
+                          Daily limit reached. Resets at {new Date(mintStatus.resetAt).toLocaleString()}.
+                        </p>
+                      )}
+                      {mintStatus?.canMint && (
+                        <p className="text-[10px] text-s-muted">
+                          Remaining today: <span className="font-mono font-semibold text-s-green">${mintStatus.remaining.toFixed(2)}</span>
+                          {' '}— Max 1 mint per day, max $1,000 per day.
+                        </p>
+                      )}
+                    </div>
+                  )}
+
                   <div className="bg-s-surface border border-s-border rounded-lg p-4">
                     <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Risk Allocation</h2>
                     <div className="space-y-3">
@@ -997,6 +1460,21 @@ export default function App() {
                 <button onClick={() => setChatOpen(false)} className="text-s-muted hover:text-s-text text-xs">✕</button>
               </div>
             </div>
+            {/* Thinking stages display */}
+            {thinkLog.length > 0 && (
+              <div className="px-3 py-2 border-b border-s-border/50 bg-s-elevated/30">
+                <div className="text-[9px] text-s-muted uppercase tracking-wider mb-1.5">Reasoning stages</div>
+                <div className="flex flex-wrap gap-1">
+                  {thinkLog.map((t, i) => (
+                    <div key={i} title={t.thought}
+                      className={`text-[10px] px-1.5 py-0.5 rounded border flex items-center gap-1 cursor-help ${STAGE_COLORS[t.stage] || 'text-s-muted'} border-current/30 bg-current/5`}>
+                      <span>{STAGE_ICONS[t.stage] || '◦'}</span>
+                      <span>{t.stage}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
               {chatMsgs.length === 0 && (
                 <div className="py-4">
@@ -1008,9 +1486,10 @@ export default function App() {
                   <p className="text-[10px] text-s-muted mb-2 px-1">Quick actions:</p>
                   <div className="space-y-1.5">
                     {[
-                      ['Find me the best prediction right now', 'Runs full OODA analysis'],
-                      ['What markets are ending soon?', 'Shows urgent opportunities'],
-                      ['How is my portfolio doing?', 'Checks balance and positions'],
+                      ['Find me the best bet I can make right now', 'Full multi-stage analysis + place order'],
+                      ['What can I afford with $' + f(bal?.total || '0') + '?', 'Shows affordable options based on balance'],
+                      ['What markets end in the next 7 days?', 'Time-filtered market discovery'],
+                      ['Research the golf market', 'Deep research + price history + stats'],
                     ].map(([label, hint]) => (
                       <button key={label} onClick={() => sendChat(label)}
                         title={hint}

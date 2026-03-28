@@ -3,11 +3,23 @@ export interface Prediction {
   invalidation: string; riskNote: string; status: string
   action: string; side: string; amountUsdc: number; orderType: string
   price: number | null; kellyFraction: number | null
+  lean: 'YES' | 'NO' | null; leanReason: string | null
+  minEntryUsdc: number | null; maxAffordableUsdc: number | null
   marketName: string; venue: string; tokenId: string; conditionId: string
   endsAt: string | null; yesPrice: number; noPrice: number
   query: string; model: string; walletId: string | null
   createdAt: string; resolvedAt: string | null; pnl: number | null
   wasCorrect: boolean | null; mode?: 'real' | 'sim'
+  orderId: string | null; orderStatus: string | null
+  dateLabel?: 'today' | 'yesterday' | 'this_week' | 'older'
+}
+
+export interface MintStatus {
+  canMint: boolean; mintedToday: number; remaining: number; resetAt: string
+}
+
+export interface MintResult {
+  balance: { total: string; available: string }; minted: number; status: MintStatus; error?: string
 }
 
 export interface ScoredMarket {
@@ -26,8 +38,10 @@ export interface ChainBalance { chainId: string; address: string; balances: Reco
 export interface Position { title: string; token_id: string; side: string; size: string; pnl: string; current_price: string }
 export interface PNL { total_pnl: string; realized_pnl: string; unrealized_pnl: string }
 export interface HealthStatus { status: string; version: string; simulation: boolean; aiAvailable: boolean; predictions: number; defaultWallet: string }
-export interface DeskConfig { simulation: boolean; confidenceThreshold: number; requireApproval: boolean; model: string; risk: Record<string, number> }
-export interface PendingAction { id: string; type: string; params: Record<string, unknown>; createdAt: string; status: string }
+export interface DeskConfig { simulation: boolean; confidenceThreshold: number; requireApproval: boolean; model: string; availableModels: string[]; risk: Record<string, number>; horizonDays: number }
+export interface PricePoint { t: number; p: number }
+export interface MarketStats { volume24h: string; liquidity: string; openInterest?: string; lastPrice?: string }
+export interface PendingAction { id: string; type: string; params: Record<string, unknown>; predictionId: string | null; mode: string; createdAt: string; status: string }
 export interface AuditEntry { timestamp: string; action: string; category: string; mode: string; success: boolean }
 
 export interface DualPrediction {
@@ -39,11 +53,34 @@ export interface DualPrediction {
 export interface Note { id: string; tag: string; content: string; period: string; created_at: string }
 
 export interface ChatMessage { role: 'user' | 'assistant'; content: string }
-export interface AgentCommand { type: 'switch_tab' | 'highlight' | 'tool'; payload: unknown }
+export interface AgentCommand { type: 'switch_tab' | 'highlight' | 'tool' | 'think'; payload: unknown }
+export interface ThinkCommand { stage: string; thought: string }
 export interface HighlightCommand { element: string; message: string }
 
 export type WalletMode = 'real' | 'sim'
 export type Tab = 'dashboard' | 'markets' | 'predictions' | 'approvals' | 'audit' | 'settings'
+
+export interface OrderRequest {
+  predictionId: string
+  tokenId: string
+  side: 'BUY' | 'SELL'
+  type: 'MARKET' | 'LIMIT'
+  amount: string
+  price?: string
+  units: 'USDC' | 'SHARES'
+  venue: 'polymarket' | 'kalshi'
+}
+
+export interface OrderQuote {
+  amount: string; shares: string; averagePrice: string
+  priceImpact: string; minShares?: string; fee?: string
+}
+
+export interface OrderResult {
+  orderId: string; tokenId: string; side: string; type: string
+  amount: string; shares: string; price: string; status: string
+  predictionId: string
+}
 
 // Deposit / Withdraw types
 export interface DepositAddress {

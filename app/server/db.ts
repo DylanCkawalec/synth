@@ -33,6 +33,29 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pred_wallet_mode ON predictions(wallet_id, mode);
   CREATE INDEX IF NOT EXISTS idx_pred_created ON predictions(created_at);
 
+  CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    prediction_id TEXT,
+    mode TEXT NOT NULL DEFAULT 'real',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    order_result_json TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+  CREATE INDEX IF NOT EXISTS idx_approvals_mode ON approvals(mode);
+
+  CREATE TABLE IF NOT EXISTS sim_mints (
+    id TEXT PRIMARY KEY,
+    wallet_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_mint_wallet_date ON sim_mints(wallet_id, date);
+
   CREATE TABLE IF NOT EXISTS summaries (
     id TEXT PRIMARY KEY,
     tag TEXT NOT NULL,
@@ -111,6 +134,59 @@ export const summaryStore = {
   },
 }
 
+// ── Approval Store ────────────────────────────────────────────────
+export const approvalStore = {
+  insert(a: DbApproval) {
+    db.prepare(`INSERT INTO approvals (id, type, params_json, prediction_id, mode, status, created_at)
+      VALUES (@id, @type, @params_json, @prediction_id, @mode, @status, @created_at)`).run(a)
+  },
+  listPending(mode?: string) {
+    if (mode) return db.prepare("SELECT * FROM approvals WHERE status = 'pending' AND mode = ? ORDER BY created_at DESC").all(mode) as DbApproval[]
+    return db.prepare("SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at DESC").all() as DbApproval[]
+  },
+  listAll(limit = 100) {
+    return db.prepare('SELECT * FROM approvals ORDER BY created_at DESC LIMIT ?').all(limit) as DbApproval[]
+  },
+  getById(id: string) {
+    return db.prepare('SELECT * FROM approvals WHERE id = ?').get(id) as DbApproval | undefined
+  },
+  updateStatus(id: string, status: string, orderResultJson?: string) {
+    db.prepare('UPDATE approvals SET status = ?, resolved_at = ?, order_result_json = ? WHERE id = ?')
+      .run(status, new Date().toISOString(), orderResultJson || null, id)
+  },
+  count(status: string) {
+    return (db.prepare('SELECT COUNT(*) as c FROM approvals WHERE status = ?').get(status) as { c: number }).c
+  },
+}
+
+// ── Mint Store ────────────────────────────────────────────────────
+export const mintStore = {
+  // Returns total minted today (local date string YYYY-MM-DD)
+  todayTotal(walletId: string, date: string): number {
+    const row = db.prepare(
+      'SELECT COALESCE(SUM(amount),0) as total FROM sim_mints WHERE wallet_id = ? AND date = ?'
+    ).get(walletId, date) as { total: number }
+    return row.total
+  },
+  // Returns how many individual mints happened today
+  todayCount(walletId: string, date: string): number {
+    const row = db.prepare(
+      'SELECT COUNT(*) as c FROM sim_mints WHERE wallet_id = ? AND date = ?'
+    ).get(walletId, date) as { c: number }
+    return row.c
+  },
+  record(id: string, walletId: string, amount: number, date: string) {
+    db.prepare(
+      'INSERT INTO sim_mints (id, wallet_id, amount, date, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(id, walletId, amount, date, new Date().toISOString())
+  },
+  history(walletId: string, limit = 30) {
+    return db.prepare(
+      'SELECT * FROM sim_mints WHERE wallet_id = ? ORDER BY created_at DESC LIMIT ?'
+    ).all(walletId, limit) as DbMint[]
+  },
+}
+
 // ── Types ─────────────────────────────────────────────────────────
 export interface DbWallet {
   id: string
@@ -129,6 +205,19 @@ export interface DbPrediction {
   snapshot_json: string
   created_at: string
   model_version: string | null
+}
+
+export interface DbApproval {
+  id: string; type: string; params_json: string; prediction_id: string | null
+  mode: string; status: string; created_at: string; resolved_at: string | null; order_result_json: string | null
+}
+
+export interface DbMint {
+  id: string
+  wallet_id: string
+  amount: number
+  date: string
+  created_at: string
 }
 
 export interface DbSummary {
