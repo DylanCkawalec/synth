@@ -1,28 +1,52 @@
-FROM ghcr.io/nvidia/openshell/cluster:0.0.15@sha256:fa87623ed13daf2a3cfe0fad387e4c586b68a008943a7f4f82e627fd024093a0
+# Synth - AI Prediction Market Desk
+# Production Dockerfile for synth:latest
+
+FROM node:22-alpine AS builder
+
+WORKDIR /build
+
+# Copy and install all dependencies (including devDependencies for build)
+COPY app/package*.json ./
+RUN npm ci
+
+# Copy source and build
+COPY app/ .
+RUN npm run build
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM node:22-alpine AS runtime
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv curl && \
-    rm -rf /var/lib/apt/lists/*
+# Install curl for healthcheck
+RUN apk add --no-cache curl ca-certificates
 
-COPY pyproject.toml requirements.txt ./
-COPY src/ src/
+# Copy built frontend
+COPY --from=builder /build/dist ./app/dist
 
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+# Copy server source files
+COPY app/server ./app/server
+COPY app/package*.json ./app/
 
-ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+# Copy node_modules from builder (includes tsx and all deps)
+COPY --from=builder /build/node_modules ./app/node_modules
 
-COPY scripts/ scripts/
-COPY run.sh .
+# Create data directory
+RUN mkdir -p /app/data
 
-RUN mkdir -p /app/data && chmod +x run.sh
-
+# Expose the server port
 EXPOSE 8420
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8420/health || exit 1
+    CMD curl -f http://localhost:8420/api/health || exit 1
 
-ENTRYPOINT ["/opt/venv/bin/python", "-m", "synthesis.server"]
+# Labels
+LABEL org.opencontainers.image.title="Synth" \
+      org.opencontainers.image.description="AI-assisted prediction market desk" \
+      org.opencontainers.image.version="1.0.0"
+
+# Start the Node.js server
+WORKDIR /app/app
+CMD ["npm", "run", "server"]

@@ -1,26 +1,157 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Synth - Production Gitignore
+# Comprehensive exclusion patterns for security and cleanliness
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Secrets and Environment ───
 .env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+secrets.*
+credentials/
+credentials.*
+
+# ─── Python ───
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+*.pytype
 .venv/
 venv/
-dist/
-build/
-*.egg-info/
-.eggs/
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-*.so
-.DS_Store
-data/
-feeds/
+ENV/
+env/
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─── Node.js / Frontend ───
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.npm
+.yarn-integrity
+*.tsbuildinfo
+.parcel-cache/
+.cache/
+.eslintcache
+.stylelintcache
+.next/
+.nuxt/
+.vuepress/dist
+.serverless/
+.fusebox/
+.dynamodb/
+
+# ─── Build Outputs ───
+/app/dist/
+/dist/
+/build/
+/out/
+/.next/
+/.nuxt/
+/.output/
+
+# ─── Testing ───
+coverage/
+*.lcov
+.nyc_output/
+*.cover
+*.coverage
+htmlcov/
+.tox/
+
+# ─── Data and Logs ───
+/data/
+/logs/
+*.log
+*.log.*
 *.jsonl
+audit.jsonl
+predictions.jsonl
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
-# Frontend
-app/node_modules/
-app/dist/
-src/synthesis/ui/dist/
+# ─── IDE and Editors ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
 
-# MiroFish vendor (large, has own git)
-vendor/mirofish/.git/
+# ─── OS Generated ───
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ─── Temporary Files ───
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+# ─── Docker ───
+.dockerignore
+docker-compose.override.yml
+
+# ─── Documentation Build ───
+/site/
+/mkdocs.yml
+
+# ─── Misc ───
+*.pid
+*.seed
+*.pid.lock

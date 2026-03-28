@@ -1,6 +1,7 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-body { background: #0a0c10; color: #e2e4ea; font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace; }
+body { background: #0a0c10; color: #e2e4ea; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
 * { scrollbar-width: thin; scrollbar-color: #2a2f3e transparent; }

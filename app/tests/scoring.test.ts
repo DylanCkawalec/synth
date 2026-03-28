@@ -41,10 +41,10 @@ describe('scoreMarkets', () => {
 
   it('assigns correct urgency labels', () => {
     const markets = [
-      { event: { title: 'T' }, markets: [{ name: 'A', active: true, ends_at: mins(5), primary_token_id: '1' }] },
-      { event: { title: 'T' }, markets: [{ name: 'B', active: true, ends_at: mins(30), primary_token_id: '2' }] },
-      { event: { title: 'T' }, markets: [{ name: 'C', active: true, ends_at: mins(300), primary_token_id: '3' }] },
-      { event: { title: 'T' }, markets: [{ name: 'D', active: true, ends_at: mins(3000), primary_token_id: '4' }] },
+      { event: { title: 'Event A', slug: 'a' }, markets: [{ name: 'A', active: true, ends_at: mins(5), primary_token_id: '1' }] },
+      { event: { title: 'Event B', slug: 'b' }, markets: [{ name: 'B', active: true, ends_at: mins(30), primary_token_id: '2' }] },
+      { event: { title: 'Event C', slug: 'c' }, markets: [{ name: 'C', active: true, ends_at: mins(300), primary_token_id: '3' }] },
+      { event: { title: 'Event D', slug: 'd' }, markets: [{ name: 'D', active: true, ends_at: mins(3000), primary_token_id: '4' }] },
     ]
     const scored = scoreMarkets(markets as any)
     const urgencies = scored.map(s => s.urgency)

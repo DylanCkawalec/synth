@@ -29,8 +29,16 @@ mcp = [
 ai = [
     "openai>=1.0",
 ]
+ai-extras = [
+    "openai>=1.0",
+    "scikit-learn>=1.5",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "statsforecast>=2.0",
+    "pandas>=2.2",
+]
 all = [
-    "synthesis-trade[server,ws,mcp,ai]",
+    "synthesis-trade[server,ws,mcp,ai,ai-extras]",
 ]
 
 [project.scripts]

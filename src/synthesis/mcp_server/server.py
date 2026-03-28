@@ -24,6 +24,10 @@ from synthesis.islands.arbitrage.island import ArbitrageIsland
 from synthesis.audit.logger import AuditLogger
 from synthesis.guard.gate import ApprovalGate
 from synthesis.predictions.engine import PredictionEngine
+from synthesis.sizing.kelly import KellyCalculator
+from synthesis.calibration.calibrator import ConfidenceCalibrator
+from synthesis.ensemble.engine import EnsemblePredictionEngine
+from synthesis.swarm.bridge import MirofishBridge
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 _settings = SynthesisSettings()
@@ -47,12 +51,31 @@ _gate = ApprovalGate(
     require_approval=_settings.require_approval,
     ttl_seconds=_settings.approval_ttl_seconds,
 )
+_kelly_calc = KellyCalculator(max_fraction=0.25, fractional_multiplier=0.5)
+_calibrator = ConfidenceCalibrator(
+    method="isotonic",
+    persist_path=f"{_settings.prediction_log_dir}/calibration.json",
+)
+_swarm: MirofishBridge | None = None
+_ensemble: EnsemblePredictionEngine | None = None
 _predictions: PredictionEngine | None = None
 if _settings.openai_api_key:
     try:
         _predictions = PredictionEngine(
             openai_api_key=_settings.openai_api_key,
             model=_settings.openai_model,
+        )
+        _swarm = MirofishBridge(
+            openai_api_key=_settings.openai_api_key,
+            openai_model=_settings.openai_model,
+        )
+        _ensemble = EnsemblePredictionEngine(
+            openai_api_key=_settings.openai_api_key,
+            model=_settings.openai_model,
+            calibrator=_calibrator,
+            kelly_calculator=_kelly_calc,
+            swarm_bridge=_swarm,
+            n_perspectives=3,
         )
     except ImportError:
         pass
@@ -307,6 +330,125 @@ async def get_predictions(limit: int = 20) -> list[dict]:
         return []
     _audit.log("get_predictions", "predict", params={"limit": limit}, mode=_mode)
     return [p.model_dump() for p in _predictions.get_history(limit)]
+
+
+@mcp.tool()
+async def ensemble_predict(query: str, wallet_id: str = "", n_perspectives: int = 3) -> dict:
+    """[PREDICT] Run ensemble prediction with multiple AI analyst perspectives,
+    calibrated confidence, and Kelly-optimal sizing.
+    Returns enriched prediction with consensus analysis and commitment rationale."""
+    if not _ensemble:
+        return {"error": "Ensemble engine unavailable — set OPENAI_API_KEY in .env"}
+
+    markets: list[dict] = []
+    try:
+        events = await _market_discovery.search_markets(query=query, limit=5)
+        for ev in events:
+            for mkt in ev.markets:
+                markets.append({
+                    "event_title": ev.event.title, "market_name": mkt.name,
+                    "venue": ev.venue or mkt.venue,
+                    "yes_price": str(mkt.left_price), "no_price": str(mkt.right_price),
+                    "volume_24h": str(mkt.volume24hr), "liquidity": str(mkt.liquidity),
+                    "token_id": mkt.primary_token_id, "condition_id": mkt.condition_id,
+                    "ends_at": mkt.ends_at,
+                })
+    except Exception:
+        pass
+
+    portfolio = None
+    bankroll = 0.0
+    if wallet_id:
+        try:
+            bal = await _portfolio.get_balance(wallet_id)
+            pos = await _portfolio.get_positions(wallet_id)
+            portfolio = {"balance": bal.model_dump(), "positions": [p.model_dump() for p in pos[:10]]}
+            bankroll = float(bal.available) if bal.available else 0.0
+        except Exception:
+            pass
+
+    news_context = ""
+    try:
+        from synthesis.core.http import SynthesisHTTPClient
+        news_raw = await _http.get("/news?limit=3")
+        if isinstance(news_raw, list):
+            news_context = "\n".join(
+                n.get("news", {}).get("title", "") for n in news_raw[:3] if isinstance(n, dict)
+            )
+    except Exception:
+        pass
+
+    result = await _ensemble.predict(
+        query=query, markets=markets, portfolio=portfolio,
+        wallet_id=wallet_id or None, bankroll_usdc=bankroll,
+        news_context=news_context,
+    )
+    _audit.log("ensemble_predict", "predict", params={"query": query, "n_perspectives": n_perspectives},
+               result={"prediction_id": result.prediction_id}, mode=_mode)
+    return result.to_prediction_dict()
+
+
+@mcp.tool()
+async def swarm_scenario(query: str, news_context: str = "", ends_at: str = "") -> dict:
+    """[PREDICT] Generate a multi-agent swarm scenario analysis for a market.
+    Uses Mirofish if available, otherwise runs GPT multi-perspective debate.
+    Returns bull/bear theses, key actors, sentiment distribution, and narrative risk."""
+    if not _swarm:
+        return {"error": "Swarm bridge unavailable — set OPENAI_API_KEY in .env"}
+
+    from dataclasses import asdict
+    scenario = await _swarm.generate_scenario(
+        market_name=query,
+        resolution_criteria=query,
+        news_context=news_context,
+        ends_at=ends_at,
+    )
+    _audit.log("swarm_scenario", "predict", params={"query": query}, mode=_mode)
+    return asdict(scenario)
+
+
+@mcp.tool()
+def calibration_metrics() -> dict:
+    """[READ] Get current confidence calibration metrics (Brier score, ECE, sample count)."""
+    from dataclasses import asdict
+    metrics = _calibrator.metrics()
+    _audit.log("calibration_metrics", "read", mode=_mode)
+    return asdict(metrics)
+
+
+@mcp.tool()
+def record_prediction_outcome(
+    raw_confidence: float, was_correct: bool,
+    market_name: str = "", prediction_id: str = "",
+) -> dict:
+    """[ADMIN] Record a prediction outcome for calibration training.
+    Over time this improves the accuracy of calibrated confidence scores."""
+    _calibrator.record_outcome(raw_confidence, was_correct, market_name, prediction_id)
+    _audit.log("record_outcome", "admin", params={
+        "confidence": raw_confidence, "correct": was_correct, "market": market_name,
+    }, mode=_mode)
+    return {"recorded": True, "total_samples": _calibrator.sample_count, "fitted": _calibrator.is_fitted}
+
+
+@mcp.tool()
+def kelly_sizing_advanced(
+    win_probability: float, market_price: float,
+    bankroll_usdc: float = 0.0, current_drawdown_pct: float = 0.0,
+) -> dict:
+    """[READ] Advanced Kelly sizing with drawdown adjustment for binary markets.
+    Returns full Kelly, fractional Kelly, edge, expected value, and warnings."""
+    from dataclasses import asdict
+    if current_drawdown_pct > 0:
+        result = _kelly_calc.drawdown_adjusted(
+            win_probability, market_price, current_drawdown_pct,
+            bankroll_usdc=bankroll_usdc,
+        )
+    else:
+        result = _kelly_calc.binary_market(win_probability, market_price, bankroll_usdc)
+    _audit.log("kelly_sizing_advanced", "read", params={
+        "win_prob": win_probability, "price": market_price, "bankroll": bankroll_usdc,
+    }, mode=_mode)
+    return asdict(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

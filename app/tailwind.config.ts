@@ -5,6 +5,7 @@ export default {
   theme: {
     extend: {
       fontFamily: {
+        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
         mono: ['SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', 'monospace'],
       },
       colors: {

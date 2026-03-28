@@ -6,6 +6,7 @@ from synthesis.core.models import (
     RiskConfig, RiskCheckResult, Exposure,
     PolygonOrderRequest, Position, Balance, PNL,
 )
+from synthesis.sizing.kelly import KellyCalculator
 
 
 class RiskIsland:
@@ -13,6 +14,7 @@ class RiskIsland:
 
     def __init__(self, config: RiskConfig | None = None) -> None:
         self.config = config or RiskConfig()
+        self._kelly = KellyCalculator(max_fraction=0.25, fractional_multiplier=0.5)
 
     def check_order(
         self,
@@ -109,12 +111,28 @@ class RiskIsland:
         return RiskCheckResult(approved=True, warnings=warnings, estimated_exposure=abs(total_loss))
 
     def kelly_criterion(self, win_prob: float, odds: float) -> float:
-        """Calculate Kelly fraction: f* = (bp - q) / b where b=odds, p=win_prob, q=1-p."""
-        if odds <= 0 or win_prob <= 0 or win_prob >= 1:
-            return 0.0
-        q = 1 - win_prob
-        f = (odds * win_prob - q) / odds
-        return max(0.0, min(f, 0.25))  # Cap at 25% of bankroll
+        """Calculate Kelly fraction using the unified KellyCalculator."""
+        result = self._kelly.classical(win_prob, odds)
+        return result.full_kelly
+
+    def kelly_binary(self, win_prob: float, market_price: float, bankroll_usdc: float = 0.0) -> dict:
+        """Full Kelly analysis for binary prediction markets."""
+        from dataclasses import asdict
+        result = self._kelly.binary_market(win_prob, market_price, bankroll_usdc)
+        return asdict(result)
+
+    def kelly_with_drawdown(
+        self, win_prob: float, market_price: float,
+        current_drawdown_pct: float, bankroll_usdc: float = 0.0,
+    ) -> dict:
+        """Drawdown-adjusted Kelly that reduces sizing near loss limits."""
+        from dataclasses import asdict
+        result = self._kelly.drawdown_adjusted(
+            win_prob, market_price, current_drawdown_pct,
+            max_drawdown_pct=(self.config.max_daily_loss_usdc / max(bankroll_usdc, 1)) * 100 if bankroll_usdc else 20.0,
+            bankroll_usdc=bankroll_usdc,
+        )
+        return asdict(result)
 
     def update_config(self, **kwargs: float | int | list) -> RiskConfig:
         data = self.config.model_dump()

@@ -18,6 +18,7 @@ from synthesis.ai.prompts import (
     SINGLE_MARKET_PROMPT, SYSTEM_PROMPT,
 )
 from synthesis.core.models import RiskConfig
+from synthesis.sizing.kelly import KellyCalculator
 
 logger = logging.getLogger("synth.ai")
 
@@ -45,6 +46,7 @@ class SynthAIEngine:
         self._model = model
         self._risk_config = risk_config or RiskConfig()
         self._audit_log: list[AuditEntry] = []
+        self._kelly_calc = KellyCalculator(max_fraction=0.25, fractional_multiplier=0.5)
         self._client = httpx.AsyncClient(
             base_url="https://api.openai.com/v1",
             headers={
@@ -252,13 +254,9 @@ class SynthAIEngine:
         return result
 
     def _kelly(self, win_prob: float, price: float) -> float:
-        """Kelly criterion for binary markets: f* = (p - price) / (1 - price)."""
-        if price <= 0 or price >= 1 or win_prob <= 0 or win_prob >= 1:
-            return 0.0
-        odds = (1 - price) / price  # implied odds from price
-        q = 1 - win_prob
-        f = (odds * win_prob - q) / odds
-        return max(0.0, min(f, 0.25))
+        """Kelly criterion for binary markets using unified KellyCalculator."""
+        result = self._kelly_calc.binary_market(win_prob, price)
+        return result.fractional_kelly
 
     def get_audit_log(self) -> list[dict]:
         return [e.model_dump() for e in self._audit_log]
