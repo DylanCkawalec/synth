@@ -5,11 +5,16 @@ export interface Prediction {
   price: number | null; kellyFraction: number | null
   lean: 'YES' | 'NO' | null; leanReason: string | null
   minEntryUsdc: number | null; maxAffordableUsdc: number | null
+  yesTokenId?: string | null; noTokenId?: string | null
   marketName: string; venue: string; tokenId: string; conditionId: string
   endsAt: string | null; yesPrice: number; noPrice: number
   query: string; model: string; walletId: string | null
   createdAt: string; resolvedAt: string | null; pnl: number | null
   wasCorrect: boolean | null; mode?: 'real' | 'sim'
+  resolvedOutcome?: 'YES' | 'NO' | null
+  resolutionSource?: string | null
+  reflection?: string | null
+  updatedAt?: string | null
   orderId: string | null; orderStatus: string | null
   dateLabel?: 'today' | 'yesterday' | 'this_week' | 'older'
 }
@@ -35,7 +40,12 @@ export interface ScoredMarket {
 export interface Wallet { wallet_id: string; name: string; chains: Record<string, { address: string }> }
 export interface Balance { total: string; available: string; chains: Array<ChainBalance> }
 export interface ChainBalance { chainId: string; address: string; balances: Record<string, string> }
-export interface Position { title: string; token_id: string; side: string; size: string; pnl: string; current_price: string }
+export interface Position {
+  title: string; token_id: string; side: string; size: string; pnl: string; current_price: string
+  position?: { token_id: string; outcome: string; shares: string; avg_price: string; current_price: string; initial_value: string; current_value: string; amount_pnl: string; percent_pnl: string; redeemable: boolean; created_at: string }
+  event?: { title: string; slug: string; image: string; ends_at?: string; active: boolean; volume24hr: string }
+  market?: { question: string; ends_at: string }
+}
 export interface PNL { total_pnl: string; realized_pnl: string; unrealized_pnl: string }
 export interface HealthStatus { status: string; version: string; simulation: boolean; aiAvailable: boolean; predictions: number; defaultWallet: string }
 export interface DeskConfig { simulation: boolean; confidenceThreshold: number; requireApproval: boolean; model: string; availableModels: string[]; risk: Record<string, number>; horizonDays: number }
@@ -69,6 +79,7 @@ export interface OrderRequest {
   price?: string
   units: 'USDC' | 'SHARES'
   venue: 'polymarket' | 'kalshi'
+  mode?: 'real' | 'sim'
 }
 
 export interface OrderQuote {
@@ -77,9 +88,20 @@ export interface OrderQuote {
 }
 
 export interface OrderResult {
-  orderId: string; tokenId: string; side: string; type: string
-  amount: string; shares: string; price: string; status: string
-  predictionId: string
+  queued?: boolean
+  approvalId?: string
+  message?: string
+  orderId?: string
+  tokenId?: string
+  side?: string
+  type?: string
+  amount?: string
+  shares?: string
+  price?: string
+  status?: string
+  predictionId?: string
+  requestedAmount?: string
+  autoSized?: boolean
 }
 
 // Deposit / Withdraw types

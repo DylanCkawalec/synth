@@ -54,10 +54,52 @@ const ago = (iso: string) => { const d = Date.now() - new Date(iso).getTime(); r
 const tl = (iso: string | null) => { if (!iso) return '—'; const d = new Date(iso).getTime() - Date.now(); return d <= 0 ? 'ended' : d < 6e4 ? '<1m' : d < 36e5 ? `${Math.floor(d / 6e4)}m` : d < 864e5 ? `${Math.floor(d / 36e5)}h` : `${Math.floor(d / 864e5)}d` }
 const cc = (c: number) => c >= .75 ? 'bg-s-green' : c >= .5 ? 'bg-s-accent' : c >= .3 ? 'bg-s-warn' : 'bg-s-danger'
 const uIcons: Record<string, string> = { critical: '🔴', soon: '🟡', normal: '🟢', distant: '⚪', ended: '⚫' }
+const pct = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}%` }
+const cost = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}¢` }
 
 function truncAddr(addr: string, n = 6) { return addr ? `${addr.slice(0, n)}...${addr.slice(-4)}` : '' }
 function isValidEvmAddress(addr: string) { return /^0x[a-fA-F0-9]{40}$/.test(addr) }
 function isValidSolAddress(addr: string) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr) }
+
+// Learning metrics from prediction history
+function computeLearningMetrics(preds: Prediction[]) {
+  const resolved = preds.filter(p => p.wasCorrect !== null && p.status === 'resolved')
+  const correct = resolved.filter(p => p.wasCorrect).length
+  const total = resolved.length
+  const accuracy = total > 0 ? (correct / total) * 100 : 0
+  const avgConfidence = resolved.length > 0
+    ? resolved.reduce((sum, p) => sum + p.confidence, 0) / resolved.length
+    : 0
+  const totalPnl = resolved.reduce((sum, p) => sum + (p.pnl || 0), 0)
+  const byLean = {
+    YES: { total: 0, correct: 0 },
+    NO: { total: 0, correct: 0 }
+  }
+  for (const p of resolved) {
+    if (p.lean === 'YES' || p.lean === 'NO') {
+      byLean[p.lean].total++
+      if (p.wasCorrect) byLean[p.lean].correct++
+    }
+  }
+  return { total, correct, accuracy, avgConfidence, totalPnl, byLean }
+}
+
+function normalizePredictionMarketKey(s: string | null | undefined): string {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function predictionShadowKey(p: Prediction): string {
+  return `${p.mode || 'real'}::${normalizePredictionMarketKey(p.marketName || p.query)}`
+}
+
+function upsertPredictionList(prev: Prediction[], incoming: Prediction): Prediction[] {
+  const incomingKey = predictionShadowKey(incoming)
+  const rest = prev.filter(p => p.id !== incoming.id && predictionShadowKey(p) !== incomingKey)
+  return [incoming, ...rest]
+}
 
 // ── Wallet connection helpers (MetaMask / Phantom / any EIP-1193) ──
 type EthProvider = { request: (args: { method: string; params?: unknown[] }) => Promise<unknown>; on: (event: string, cb: (...args: unknown[]) => void) => void; removeListener: (event: string, cb: (...args: unknown[]) => void) => void }
@@ -146,6 +188,8 @@ export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const [config, setConfig] = useState<DeskConfig | null>(null)
   const [bal, setBal] = useState<Balance | null>(null)
+  const [simBal, setSimBal] = useState<Balance | null>(null)
+  const [liveBal, setLiveBal] = useState<Balance | null>(null)
   const [pos, setPos] = useState<Position[]>([])
   const [pnl, setPnl] = useState<PNL | null>(null)
   const [preds, setPreds] = useState<Prediction[]>([])
@@ -180,6 +224,9 @@ export default function App() {
   // Approvals filter
   const [approvalFilter, setApprovalFilter] = useState<'all' | 'live' | 'sim'>('all')
 
+  // Position view tabs
+  const [positionView, setPositionView] = useState<'open' | 'closed'>('open')
+
   // Sim mint
   const [mintStatus, setMintStatus] = useState<MintStatus | null>(null)
   const [mintAmount, setMintAmount] = useState('100')
@@ -202,6 +249,30 @@ export default function App() {
   const [withdrawAddress, setWithdrawAddress] = useState('')
   const [withdrawUseMetaMask, setWithdrawUseMetaMask] = useState(true)
   const [withdrawLoading, setWithdrawLoading] = useState(false)
+
+  // Commit approval modal
+  const [commitModal, setCommitModal] = useState<Prediction | null>(null)
+  const [commitAmt, setCommitAmt] = useState('')
+  const [commitDir, setCommitDir] = useState<'YES' | 'NO'>('YES')
+
+  // Crypto auto-predict state
+  const [cryptoPredicting, setCryptoPredicting] = useState<Set<string>>(new Set())
+  const [predictAllLoading, setPredictAllLoading] = useState(false)
+
+  const openCommitModal = (p: Prediction) => {
+    const sugAmt = p.amountUsdc > 0 ? p.amountUsdc : Math.max(p.minEntryUsdc || 0.50, 1)
+    setCommitAmt(String(sugAmt.toFixed(2)))
+    setCommitDir((p.lean as 'YES' | 'NO') || 'YES')
+    setCommitModal(p)
+  }
+
+  const confirmCommit = async () => {
+    if (!commitModal) return
+    const amt = parseFloat(commitAmt) || 0
+    if (amt <= 0) { flash('Enter a valid amount'); return }
+    await placeOrder(commitModal, amt, commitDir)
+    setCommitModal(null)
+  }
 
   const flash = (m: string) => { setToast(m); setTimeout(() => setToast(''), 3000) }
 
@@ -226,6 +297,8 @@ export default function App() {
     try { const [h, c] = await Promise.all([api.getHealth(), api.getConfig()]); setHealth(h); setConfig(c) } catch {/**/}
     if (wid) {
       try { setBal(await api.getBalance(wid, wMode)) } catch {/**/}
+      try { setSimBal(await api.getBalance(wid, 'sim')) } catch {/**/}
+      try { setLiveBal(await api.getBalance(wid, 'real')) } catch {/**/}
       try { setPos(await api.getPositions(wid)) } catch {/**/}
       try { setPnl(await api.getPnl(wid)) } catch {/**/}
     }
@@ -239,25 +312,56 @@ export default function App() {
   useEffect(() => { refresh() }, [refresh])
   useEffect(() => { const iv = setInterval(refresh, 12_000); return () => clearInterval(iv) }, [refresh])
 
-  const predict = async (query: string) => {
+  const predict = async (query: string, navigate = true) => {
     setLoading(true)
-    try { const p = await api.generatePrediction(query, wid || undefined); setPreds(prev => [p, ...prev]); setTab('predictions'); flash('Prediction generated') }
+    try {
+      const p = await api.generatePrediction(query, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
+      setPreds(prev => upsertPredictionList(prev, p))
+      if (navigate) setTab('predictions')
+      flash('Prediction generated')
+      return p
+    }
+    catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Unknown'}`); return null }
+    finally { setLoading(false) }
+  }
+
+  const predictAndCommit = async (query: string) => {
+    setLoading(true)
+    try {
+      const p = await api.generatePrediction(query, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
+      setPreds(prev => upsertPredictionList(prev, p))
+      openCommitModal(p)
+    }
     catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Unknown'}`) }
     finally { setLoading(false) }
   }
 
-  const resolve = async (id: string, correct: boolean) => {
+  const cryptoPredict = async (market: ScoredMarket) => {
+    const tid = market.token_id
+    setCryptoPredicting(prev => new Set(prev).add(tid))
     try {
-      await api.resolvePrediction(id, correct)
-      await refresh()
-      if (correct) {
-        flash('🏆 Prediction correct! Well done.')
-        triggerCelebration('confetti')
-      } else {
-        flash('Marked incorrect — keep learning.')
-      }
+      const p = await api.generatePrediction(market.market_name || market.event_title, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
+      setPreds(prev => upsertPredictionList(prev, p))
+      openCommitModal(p)
+    } catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Unknown'}`) }
+    finally { setCryptoPredicting(prev => { const n = new Set(prev); n.delete(tid); return n }) }
+  }
+
+  const predictAllCrypto = async (markets: ScoredMarket[]) => {
+    setPredictAllLoading(true)
+    const results: Prediction[] = []
+    for (const m of markets.slice(0, 6)) {
+      try {
+        const p = await api.generatePrediction(m.market_name || m.event_title, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
+        results.push(p)
+        setPreds(prev => upsertPredictionList(prev, p))
+      } catch { /* continue */ }
     }
-    catch (e) { flash(`Error: ${e instanceof Error ? e.message : 'Failed'}`) }
+    setPredictAllLoading(false)
+    if (results.length > 0) {
+      setTab('predictions')
+      flash(`${results.length} crypto predictions generated — review and commit`)
+    }
   }
 
   const deletePred = async (id: string) => {
@@ -267,26 +371,38 @@ export default function App() {
 
   const [orderLoading, setOrderLoading] = useState<string | null>(null)
 
-  const placeOrder = async (p: Prediction, amountOverride?: number) => {
-    if (!wid || !p.tokenId) { flash('Missing wallet or token ID'); return }
+  const placeOrder = async (p: Prediction, amountOverride?: number, directionOverride?: 'YES' | 'NO') => {
+    const direction = directionOverride || (p.lean as 'YES' | 'NO') || 'YES'
+    const chosenTokenId = direction === 'NO' ? (p.noTokenId || p.tokenId) : (p.yesTokenId || p.tokenId)
+    if (!wid || !chosenTokenId) { flash('Missing wallet or token ID'); return }
     setOrderLoading(p.id)
     try {
       const amount = String(amountOverride ?? p.amountUsdc)
       const result = await api.placeOrder(wid, {
         predictionId: p.id,
-        tokenId: p.tokenId,
-        side: (p.side as 'BUY' | 'SELL') || 'BUY',
+        tokenId: chosenTokenId,
+        side: 'BUY',
         type: (p.orderType as 'MARKET' | 'LIMIT') || 'MARKET',
         amount,
         units: 'USDC',
         venue: (p.venue?.toLowerCase().includes('kalshi') ? 'kalshi' : 'polymarket') as 'polymarket' | 'kalshi',
+        mode: wMode === 'sim' ? 'sim' : 'real',
       })
-      if ('queued' in result) {
-        flash('Order queued for approval — check Approvals tab')
+      setCommitModal(null)
+      if (result.queued) {
+        flash('Live order queued — approve it in the Approvals tab to execute')
         setTab('approvals')
+        await refresh()
       } else {
-        flash(`🎆 Position filled: ${result.orderId?.slice(0, 12)}...`)
-        triggerCelebration('fireworks')
+        const isSim = wMode === 'sim'
+        const autoSizedMsg = result.autoSized && result.amount
+          ? ` (auto-sized to $${result.amount} for available liquidity)`
+          : ''
+        flash(isSim
+          ? `Practice bet placed: ${result.orderId?.slice(0, 12)}...${autoSizedMsg}`
+          : `🎆 Live order executed: ${result.orderId?.slice(0, 12)}...${autoSizedMsg}`)
+        triggerCelebration(isSim ? 'confetti' : 'fireworks')
+        setTab('dashboard')
         await refresh()
       }
     } catch (e) { flash(`Order failed: ${e instanceof Error ? e.message : 'Unknown'}`) }
@@ -469,33 +585,71 @@ export default function App() {
   const avail = parseFloat(bal?.available || '0')
   const committed = total - avail
   const util = total > 0 ? (committed / total) * 100 : 0
-  const best = mkts[0] || null
-  const urgentMkts = mkts.filter(m => m.urgency === 'critical' || m.urgency === 'soon')
   const [lastRefresh, setLastRefresh] = useState(Date.now())
   const refreshAge = Math.round((Date.now() - lastRefresh) / 1000)
 
-  // Deduplicate: one card per market name per day, latest wins
-  // Then sort: affordable+uncommitted first (actionable now), then committed, then others
+  // Live Polymarket positions split by whether market has ended
+  const liveOpenPos = useMemo(() => pos.filter(pp => {
+    const endsAt = pp.market?.ends_at || pp.event?.ends_at || null
+    if (!endsAt) return true
+    return new Date(endsAt).getTime() > Date.now()
+  }), [pos])
+  const liveClosedPos = useMemo(() => pos.filter(pp => {
+    const endsAt = pp.market?.ends_at || pp.event?.ends_at || null
+    return !!endsAt && new Date(endsAt).getTime() <= Date.now()
+  }), [pos])
+
+  // Sim/practice positions: committed bets. Split into open vs ended.
+  const simPositions = useMemo(() => {
+    const isSim = (p: Prediction) => p.mode === 'sim' || (p.orderId && String(p.orderId).startsWith('sim_'))
+    return preds.filter(p => isSim(p) && (p.status === 'committed' || !!p.orderId) && p.status !== 'resolved')
+  }, [preds])
+  const simOpenPos = useMemo(() => simPositions.filter(p =>
+    !p.endsAt || new Date(p.endsAt).getTime() > Date.now()
+  ), [simPositions])
+  const simClosedPos = useMemo(() => simPositions.filter(p =>
+    !!p.endsAt && new Date(p.endsAt).getTime() <= Date.now()
+  ), [simPositions])
+
+  // Resolved predictions (outcome known)
+  const resolvedPreds = useMemo(() =>
+    preds.filter(p => p.status === 'resolved' || p.wasCorrect !== null)
+      .sort((a, b) => new Date(b.resolvedAt || b.createdAt).getTime() - new Date(a.resolvedAt || a.createdAt).getTime())
+  , [preds])
+
+  // Deduplicate: one card per market+mode combination, latest wins
+  // Committed positions are always kept; generated are deduped by market+day
   const dedupedPreds = useMemo(() => {
+    // First pass: collect all committed predictions (keep all)
+    const committed = preds.filter(p => p.status === 'committed' || !!p.orderId)
+    // Second pass: deduplicate generated ones
     const seen = new Map<string, Prediction>()
+    const maxDaysOut = 60
     for (const p of preds) {
+      if (p.status === 'committed' || !!p.orderId) continue
+      if (p.status === 'resolved') continue
+      if (p.endsAt) {
+        const daysOut = (new Date(p.endsAt).getTime() - Date.now()) / 864e5
+        if (daysOut > maxDaysOut || daysOut < 0) continue
+      }
       const dayKey = p.createdAt.slice(0, 10)
-      const key = `${p.marketName || p.query}::${dayKey}`
+      const key = `${p.mode || 'real'}::${normalizePredictionMarketKey(p.marketName || p.query)}::${dayKey}`
       if (!seen.has(key)) seen.set(key, p)
     }
-    const all = [...seen.values()]
-    return all.sort((a, b) => {
-      // Committed (active positions) come first for tracking
-      const aCommitted = !!(a.status === 'committed' || a.orderId)
-      const bCommitted = !!(b.status === 'committed' || b.orderId)
-      if (aCommitted !== bCommitted) return aCommitted ? -1 : 1
-      // Then sort by affordability × confidence
-      const aAfford = (a.maxAffordableUsdc || 0) >= (a.minEntryUsdc || 0.10) && a.status !== 'resolved'
-      const bAfford = (b.maxAffordableUsdc || 0) >= (b.minEntryUsdc || 0.10) && b.status !== 'resolved'
-      if (aAfford !== bAfford) return aAfford ? -1 : 1
-      return b.confidence - a.confidence
+    const generated = [...seen.values()]
+    const all = [...committed, ...generated, ...resolvedPreds].sort((a, b) => {
+      // Sort: resolved last, then by time remaining ASC (soonest first)
+      const aResolved = a.status === 'resolved'
+      const bResolved = b.status === 'resolved'
+      if (aResolved !== bResolved) return aResolved ? 1 : -1
+      const aEnds = a.endsAt ? new Date(a.endsAt).getTime() : Infinity
+      const bEnds = b.endsAt ? new Date(b.endsAt).getTime() : Infinity
+      return aEnds - bEnds
     })
-  }, [preds])
+    // Remove pure duplicates (same id)
+    const ids = new Set<string>()
+    return all.filter(p => { if (ids.has(p.id)) return false; ids.add(p.id); return true })
+  }, [preds, resolvedPreds])
 
   // Group by dateLabel for section headers
   const groupedPreds = useMemo(() => {
@@ -542,6 +696,175 @@ export default function App() {
   return (
     <div className="min-h-screen flex flex-col font-sans text-[13px]">
       {celebration && <Celebration type={celebration} onDone={() => setCelebration(null)} />}
+
+      {/* ── COMMIT APPROVAL MODAL ── */}
+      {commitModal && (() => {
+        const p = commitModal
+        const isSim = wMode === 'sim'
+        const modeBal = isSim ? simBal : liveBal
+        const modeTotal = parseFloat(modeBal?.total || '0')
+        const leanPrice = commitDir === 'YES' ? p.yesPrice : p.noPrice
+        const amt = parseFloat(commitAmt) || 0
+        const minE = Math.max(0.10, leanPrice > 0 ? leanPrice : (p.minEntryUsdc || 0.50))
+        const maxA = Math.min(p.maxAffordableUsdc || 100, modeTotal * 0.10)
+        const canAffordAnything = modeTotal >= minE
+        const estShares = leanPrice > 0 ? (amt / leanPrice) : 0
+        const quickAmts = [1, 5, 10, 25, 50, 100].filter(a => a >= minE && a <= maxA)
+        const isPlacing = orderLoading === p.id
+        return (
+          <div className="fixed inset-0 z-[900] flex items-center justify-center" onClick={() => !isPlacing && setCommitModal(null)}>
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+            <div className="relative w-full max-w-md mx-4 rounded-2xl overflow-hidden shadow-2xl" onClick={e => e.stopPropagation()}>
+              {/* Mode banner */}
+              <div className={`px-5 py-3 text-center text-sm font-black tracking-wider ${
+                isSim ? 'bg-s-blue text-white' : 'bg-s-warn text-black'
+              }`}>
+                {isSim ? '🔵 PRACTICE MODE — No Real Money' : '🔴 LIVE MODE — Real Money'}
+              </div>
+
+              <div className="bg-s-surface p-5 space-y-4">
+                {/* Balance bar */}
+                <div className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs ${isSim ? 'bg-s-blue/10 border border-s-blue/20' : 'bg-s-warn/10 border border-s-warn/20'}`}>
+                  <span className="text-s-muted">Your {isSim ? 'practice' : 'live'} balance</span>
+                  <span className="font-black text-base">${f(modeTotal)}</span>
+                </div>
+                {!canAffordAnything && (
+                  <div className="bg-s-danger/10 border border-s-danger/30 rounded-lg px-3 py-2 text-xs text-s-danger font-semibold">
+                    Insufficient balance. Min bet is ${f(minE)}. {isSim ? 'Mint practice funds in Settings.' : 'Deposit funds in Settings > Deposit.'}
+                  </div>
+                )}
+
+                {/* Market name */}
+                <div>
+                  <div className="text-[10px] text-s-muted uppercase tracking-wider mb-1">Market</div>
+                  <div className="text-sm font-bold">{p.marketName || p.query}</div>
+                  <div className="flex gap-3 mt-1 text-[10px] text-s-muted">
+                    <span>{p.venue}</span>
+                    <span>Ends {tl(p.endsAt)}</span>
+                    <span className={`font-bold px-1.5 py-0.5 rounded ${cc(p.confidence)} text-black`}>{Math.round(p.confidence * 100)}%</span>
+                  </div>
+                  {p.thesis && <div className="text-[10px] text-s-muted mt-1 italic">"{p.thesis.slice(0, 100)}"</div>}
+                </div>
+
+                {/* STEP 1: Direction — big prominent YES / NO */}
+                <div>
+                  <div className="text-[10px] text-s-muted uppercase tracking-wider mb-1">Step 1 — Pick your side</div>
+                  <div className="flex gap-3">
+                    <button onClick={() => setCommitDir('YES')}
+                      className={`flex-1 py-4 rounded-xl transition-all ${
+                        commitDir === 'YES'
+                          ? 'bg-s-green text-black ring-2 ring-s-green shadow-lg shadow-s-green/30 scale-[1.02]'
+                          : 'bg-s-elevated text-s-muted hover:text-s-green hover:bg-s-green/10 border-2 border-s-border hover:border-s-green/40'
+                      }`}>
+                      <div className="text-base font-black">YES — It happens</div>
+                      <div className="text-[10px] opacity-80">{pct(p.yesPrice)} chance · {cost(p.yesPrice)}/share</div>
+                    </button>
+                    <button onClick={() => setCommitDir('NO')}
+                      className={`flex-1 py-4 rounded-xl transition-all ${
+                        commitDir === 'NO'
+                          ? 'bg-s-danger text-white ring-2 ring-s-danger shadow-lg shadow-s-danger/30 scale-[1.02]'
+                          : 'bg-s-elevated text-s-muted hover:text-s-danger hover:bg-s-danger/10 border-2 border-s-border hover:border-s-danger/40'
+                      }`}>
+                      <div className="text-base font-black">NO — It doesn't</div>
+                      <div className="text-[10px] opacity-80">{pct(p.noPrice)} chance · {cost(p.noPrice)}/share</div>
+                    </button>
+                  </div>
+                  {p.lean && (
+                    <div className={`mt-2 text-[10px] px-3 py-1.5 rounded-lg border ${
+                      p.lean === 'YES' ? 'bg-s-green/10 border-s-green/20 text-s-green' : 'bg-s-danger/10 border-s-danger/20 text-s-danger'
+                    }`}>
+                      AI leans <strong>{p.lean}</strong>: {p.leanReason?.slice(0, 80) || p.thesis?.slice(0, 80)}
+                    </div>
+                  )}
+                </div>
+
+                {/* STEP 2: Amount */}
+                <div>
+                  <div className="text-[10px] text-s-muted uppercase tracking-wider mb-2">Step 2 — How much?</div>
+                  <div className="flex items-center gap-2 bg-s-bg border-2 border-s-border rounded-lg px-4 py-3 focus-within:border-s-accent transition-colors">
+                    <span className="text-lg font-bold text-s-muted">$</span>
+                    <input type="number" step="0.01" min={minE} max={maxA} value={commitAmt}
+                      onChange={e => setCommitAmt(e.target.value)}
+                      className="flex-1 bg-transparent text-2xl font-black text-s-text outline-none" autoFocus />
+                  </div>
+                  <div className="flex gap-1.5 mt-2">
+                    {quickAmts.slice(0, 6).map(a => (
+                      <button key={a} onClick={() => setCommitAmt(String(a))}
+                        className={`flex-1 py-1.5 rounded text-[11px] font-bold transition-all ${
+                          Math.round(amt) === a
+                            ? 'bg-s-accent text-black'
+                            : 'bg-s-elevated text-s-muted border border-s-border hover:border-s-accent hover:text-s-text'
+                        }`}>
+                        ${a}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex justify-between mt-2 text-[10px] text-s-muted">
+                    <span>Min: ${f(minE)} · Max: ${f(maxA)}</span>
+                    <span>~{f(estShares, 1)} shares @ ${f(leanPrice)}</span>
+                  </div>
+                </div>
+
+                {/* STEP 3: Review & Confirm */}
+                <div>
+                  <div className="text-[10px] text-s-muted uppercase tracking-wider mb-2">Step 3 — Confirm</div>
+                  <div className="bg-s-panel rounded-xl p-4 border border-s-border space-y-2">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-s-muted">Position</span>
+                      <span className="font-black text-base">
+                        <span className={commitDir === 'YES' ? 'text-s-green' : 'text-s-danger'}>{commitDir}</span>
+                        {' '}${f(amt)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-s-muted">Entry price</span>
+                      <span className="font-mono font-bold">${f(leanPrice)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-s-muted">Est. shares</span>
+                      <span className="font-mono font-bold">{f(estShares, 2)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-s-muted">Potential payout if correct</span>
+                      <span className="font-bold text-s-green text-base">${f(leanPrice > 0 ? amt / leanPrice : 0)}</span>
+                    </div>
+                    <div className="h-px bg-s-border my-1" />
+                    <div className="flex justify-between text-xs">
+                      <span className="text-s-muted">Mode</span>
+                      <span className={`font-black ${isSim ? 'text-s-blue' : 'text-s-warn'}`}>{isSim ? '🔵 PRACTICE' : '🔴 LIVE'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action buttons */}
+                <div className="flex gap-2">
+                  <button onClick={() => setCommitModal(null)} disabled={isPlacing}
+                    className="py-3 px-4 rounded-lg text-xs font-bold bg-s-elevated text-s-muted border border-s-border hover:text-s-text transition-all">
+                    Cancel
+                  </button>
+                  <button onClick={() => { setCommitModal(null); predict(p.marketName || p.query, true) }} disabled={isPlacing}
+                    className="py-3 px-4 rounded-lg text-xs font-bold bg-s-elevated text-s-muted border border-s-border hover:text-s-accent transition-all"
+                    title="Generate a new AI analysis for this market">
+                    ↻ Re-predict
+                  </button>
+                  <button onClick={confirmCommit} disabled={isPlacing || amt < minE || amt > modeTotal || !canAffordAnything}
+                    className={`flex-1 py-3.5 rounded-lg text-sm font-black transition-all disabled:opacity-40 ${
+                      isSim
+                        ? 'bg-s-green text-black hover:brightness-110 shadow-lg shadow-s-green/20'
+                        : 'bg-s-warn text-black hover:brightness-110 shadow-lg shadow-s-warn/20'
+                    }`}>
+                    {isPlacing ? 'Placing Order...' : isSim
+                      ? `✓ Place Practice Bet — $${f(amt)} ${commitDir}`
+                      : `✓ Place Live Order — $${f(amt)} ${commitDir}`
+                    }
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Header */}
       <header className="flex items-center justify-between px-5 h-12 bg-s-surface border-b border-s-border sticky top-0 z-50">
         <div className="flex items-center gap-3">
@@ -552,8 +875,8 @@ export default function App() {
             <button key={t} onClick={() => { setTab(t); if (t === 'audit') api.getAudit().then(setAudit).catch(() => {}) }}
               className={`px-3 py-1.5 rounded text-xs transition-all duration-200 ${tab === t ? 'text-s-accent bg-s-panel border-b-2 border-s-accent' : 'text-s-muted hover:text-s-text hover:bg-s-panel/50'}`}>
               {t.charAt(0).toUpperCase() + t.slice(1)}
-              {t === 'approvals' && (pending.length > 0 || (health as (HealthStatus & { pendingApprovals?: number }))?.pendingApprovals) && (
-                <span className="ml-1 bg-s-danger text-white text-[9px] px-1.5 rounded-full font-bold">
+              {t === 'approvals' && ((health as (HealthStatus & { pendingApprovals?: number }))?.pendingApprovals || pending.length) > 0 && (
+                <span className="ml-1.5 bg-s-danger text-white text-[9px] px-1.5 py-0.5 rounded-full font-bold">
                   {(health as (HealthStatus & { pendingApprovals?: number }))?.pendingApprovals || pending.length}
                 </span>
               )}
@@ -585,15 +908,21 @@ export default function App() {
           </button>
         </div>
 
-        {/* Balance info */}
+        {/* Active balance (mode-specific) */}
+        <div className="flex items-center gap-1.5 px-3 border-r border-s-border whitespace-nowrap">
+          <span className="text-[10px] text-s-muted uppercase tracking-wide">{wMode === 'sim' ? 'Practice $' : 'Live $'}</span>
+          <span className="font-bold font-mono text-s-text">{f(bal?.total || '0')}</span>
+        </div>
+
+        {/* Other mode balance (dimmed) */}
+        <div className="flex items-center gap-1.5 px-3 border-r border-s-border whitespace-nowrap opacity-50">
+          <span className="text-[10px] text-s-muted uppercase tracking-wide">{wMode === 'sim' ? 'Live $' : 'Practice $'}</span>
+          <span className="font-semibold font-mono text-s-muted">{f(wMode === 'sim' ? (liveBal?.total || '0') : (simBal?.total || '0'))}</span>
+        </div>
+
         {[
-          ['Balance', `$${f(bal?.total || '0')}`],
-          ['Available', `$${f(bal?.available || '0')}`],
-          ['Committed', `$${f(committed)}`],
-          ['Utilization', `${f(util, 1)}%`],
           ['P&L', `${totalPnl >= 0 ? '+' : ''}$${f(Math.abs(totalPnl))}`],
-          ['Positions', String(pos.length)],
-          ['Max Risk', `$${f(config?.risk?.maxPositionUsdc || 0)}`],
+          ['Positions', String(preds.filter(p => (p.orderId || p.status === 'committed') && p.wasCorrect === null).length + liveOpenPos.length)],
         ].map(([label, value], i) => (
           <div key={i} className="flex items-center gap-1.5 px-3 border-r border-s-border last:border-r-0 whitespace-nowrap">
             <span className="text-[10px] text-s-muted uppercase tracking-wide">{label}</span>
@@ -618,113 +947,265 @@ export default function App() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Main content */}
-        <main className={`flex-1 p-4 overflow-y-auto transition-all duration-300 ${chatOpen ? 'mr-[360px]' : ''}`}>
+        <main className={`flex-1 p-3 overflow-y-auto transition-all duration-300 min-h-0 ${chatOpen ? 'mr-[360px]' : ''}`}>
           {toast && <div className="fixed top-14 right-5 bg-s-panel border border-s-accent text-s-text px-4 py-2.5 rounded text-xs z-50 animate-[slideIn_0.2s_ease-out]">{toast}</div>}
 
           {/* ── DASHBOARD ── */}
-          {tab === 'dashboard' && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {/* Next Best */}
-              <div data-synth-id="next-best" className={`relative lg:col-span-2 bg-s-surface border border-s-border rounded-lg p-4 ${hl('next-best')}`}>
-                {hlTooltip('next-best')}
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Next Best Opportunity</h2>
-                {best ? (
-                  <div className="flex flex-col gap-3">
-                    <div className="flex items-center gap-2.5">
-                      <span>{uIcons[best.urgency] || '⚪'}</span>
-                      <span className="text-sm font-semibold flex-1">{best.market_name || best.event_title}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted uppercase">{best.venue}</span>
-                    </div>
-                    <div className="flex gap-6">
-                      {[['Yes', f(best.yes_price)], ['No', f(best.no_price)], ['Score', String(best.score)], ['Ends', tl(best.ends_at)]].map(([l, v]) => (
-                        <div key={l} className="flex flex-col"><span className="text-[10px] text-s-muted uppercase">{l}</span><span className="text-sm font-semibold">{v}</span></div>
-                      ))}
-                    </div>
-                    <button disabled={loading} onClick={() => predict(best.market_name || best.event_title)}
-                      title="Ask AI to analyze this market and suggest a trade"
-                      className={`self-start px-5 py-2.5 bg-s-accent text-black font-bold rounded text-xs hover:brightness-110 disabled:opacity-50 transition-all ${best.score > 0.7 ? 'animate-[glow_2s_ease-in-out_infinite]' : ''}`}>
-                      {loading ? 'Analyzing...' : '→ Generate Prediction'}
-                    </button>
-                  </div>
-                ) : <p className="text-s-muted text-xs">Loading markets...</p>}
-              </div>
+          {tab === 'dashboard' && (() => {
+            const metrics = computeLearningMetrics(preds)
+            const livePnl = parseFloat(pnl?.total_pnl || '0')
+            const liveBal$ = parseFloat(liveBal?.total || '0')
+            const simBal$ = parseFloat(simBal?.total || '0')
+            const allOpenCount = liveOpenPos.length + simOpenPos.length
+            const closedCount = liveClosedPos.length + simClosedPos.length + resolvedPreds.length
+            const closingSoon = mkts.filter(m => m.minutesLeft !== null && m.minutesLeft > 0 && m.minutesLeft <= 2880)
+              .sort((a, b) => (a.minutesLeft ?? 9999) - (b.minutesLeft ?? 9999))
+            const cryptoMkts = mkts
+              .filter(m => (m.market_name || m.event_title || '').match(/\b(btc|eth|sol|doge|xrp|bnb|bitcoin|ethereum|solana|crypto|hype|hyperliquid)\b/i))
+              .sort((a, b) => (a.minutesLeft ?? 99999) - (b.minutesLeft ?? 99999))
+              .slice(0, 8)
+            return (
+            <div className="flex flex-col gap-3">
 
-              {/* Ending Soon */}
-              <div data-synth-id="ending-soon" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('ending-soon')}`}>
-                {hlTooltip('ending-soon')}
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Ending Soon</h2>
-                <div className="flex flex-col gap-1">
-                  {urgentMkts.slice(0, 8).map(m => (
-                    <div key={m.token_id} onClick={() => predict(m.market_name || m.event_title)}
-                      className="flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer hover:bg-s-panel transition-colors">
-                      <span className="text-xs">{uIcons[m.urgency]}</span>
-                      <span className="flex-1 text-xs truncate">{m.market_name || m.event_title}</span>
-                      <span className="text-[11px] text-s-warn font-semibold">{tl(m.ends_at)}</span>
-                    </div>
-                  ))}
-                  {urgentMkts.length === 0 && <p className="text-s-muted text-xs">No urgent markets right now</p>}
-                </div>
-              </div>
-
-              {/* Recent Predictions */}
-              <div data-synth-id="recent-preds" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('recent-preds')}`}>
-                {hlTooltip('recent-preds')}
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Recent Predictions</h2>
-                {preds.slice(0, 5).map(p => (
-                  <div key={p.id} className="border border-s-border rounded p-2 mb-1.5">
-                    <div className="flex items-center gap-2">
-                      <span className="flex-1 text-xs truncate">{p.thesis.slice(0, 80)}</span>
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded text-black ${cc(p.confidence)}`}>{Math.round(p.confidence * 100)}%</span>
-                    </div>
-                    <div className="flex gap-3 mt-1 text-[10px] text-s-muted">
-                      <span className="font-semibold">{p.action}</span><span>{p.venue}</span><span>{ago(p.createdAt)}</span>
-                      {p.wasCorrect !== null && <span className={p.wasCorrect ? 'text-s-green font-semibold' : 'text-s-danger font-semibold'}>{p.wasCorrect ? '✓ Correct' : '✗ Wrong'}</span>}
+              {/* ── METRIC ROW — compact single-line KPI strip ── */}
+              <div className="flex items-center gap-px bg-s-border rounded-xl overflow-hidden border border-s-border">
+                {[
+                  { label: 'Live', value: `$${f(liveBal$)}`, sub: `${liveOpenPos.length} pos`, color: 'text-s-warn', dot: 'bg-s-warn' },
+                  { label: 'Practice', value: `$${f(simBal$)}`, sub: `${simOpenPos.length} bets`, color: 'text-s-blue', dot: 'bg-s-blue' },
+                  { label: 'Unrealized P&L', value: `${livePnl >= 0 ? '+' : ''}$${f(Math.abs(livePnl))}`, sub: livePnl < 0 ? 'loss' : 'gain', color: livePnl >= 0 ? 'text-s-green' : 'text-s-danger', dot: livePnl >= 0 ? 'bg-s-green' : 'bg-s-danger' },
+                  { label: 'AI Accuracy', value: metrics.total > 0 ? `${metrics.accuracy.toFixed(0)}%` : '—', sub: `${metrics.correct}/${metrics.total} calls`, color: metrics.accuracy >= 55 ? 'text-s-green' : 'text-s-warn', dot: 'bg-s-accent' },
+                  { label: 'Open Positions', value: String(allOpenCount), sub: `${closedCount} closed`, color: 'text-s-text', dot: 'bg-s-muted' },
+                ].map((s, i) => (
+                  <div key={i} className="flex-1 flex items-center gap-2 px-3 py-2.5 bg-s-surface">
+                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${s.dot}`} />
+                    <div className="min-w-0 flex items-baseline gap-1.5 flex-wrap">
+                      <span className={`text-sm font-black font-mono leading-none ${s.color}`}>{s.value}</span>
+                      <span className="text-[9px] text-s-muted uppercase tracking-wide leading-none">{s.label}</span>
                     </div>
                   </div>
                 ))}
-                {preds.length === 0 && <p className="text-s-muted text-xs">No predictions yet — ask NemoClaw or click Generate</p>}
               </div>
 
-              {/* Calendar Timeline */}
-              <div data-synth-id="calendar" className={`relative lg:col-span-2 bg-s-surface border border-s-border rounded-lg p-4 ${hl('calendar')}`}>
-                {hlTooltip('calendar')}
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Prediction Calendar — Next 24h</h2>
-                <div className="flex gap-2 overflow-x-auto pb-2">
-                  {mkts.filter(m => m.minutesLeft !== null && m.minutesLeft > 0 && m.minutesLeft <= 1440).slice(0, 12).map(m => (
-                    <div key={m.token_id} onClick={() => predict(m.market_name || m.event_title)}
-                      className={`flex-shrink-0 w-44 p-2.5 rounded-lg border cursor-pointer hover:brightness-110 transition-all ${
-                        m.urgency === 'critical' ? 'border-s-danger bg-s-danger/10' : m.urgency === 'soon' ? 'border-s-warn bg-s-warn/10' : 'border-s-border bg-s-panel'}`}>
-                      <div className="text-[10px] font-bold text-s-muted uppercase mb-1">{tl(m.ends_at)}</div>
-                      <div className="text-xs font-semibold truncate">{m.market_name || m.event_title}</div>
-                      <div className="flex gap-2 mt-1 text-[10px] text-s-muted">
-                        <span>Yes: {f(m.yes_price)}</span>
-                        <span>Score: {m.score}</span>
+              {/* ── BODY: 3-island grid — Positions | Feed | (Crypto stacked below feed) ── */}
+              <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-3">
+
+                {/* ─── LEFT: MY POSITIONS ─── */}
+                <div className="bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col">
+                  {/* Island header */}
+                  <div className="flex items-center gap-3 px-3 py-2.5 border-b border-s-border flex-shrink-0">
+                    <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">Positions</span>
+                    <div className="flex bg-s-elevated rounded p-0.5 ml-auto">
+                      <button onClick={() => setPositionView('open')} className={`px-2.5 py-0.5 rounded text-[9px] font-bold transition-all ${positionView === 'open' ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text'}`}>
+                        Open ({allOpenCount})
+                      </button>
+                      <button onClick={() => setPositionView('closed')} className={`px-2.5 py-0.5 rounded text-[9px] font-bold transition-all ${positionView === 'closed' ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text'}`}>
+                        Closed ({closedCount})
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1 p-2 overflow-y-auto" style={{maxHeight:'calc(100vh - 260px)'}}>
+                    {positionView === 'open' && (
+                      <>
+                        {liveOpenPos.length === 0 && simOpenPos.length === 0 && (
+                          <div className="text-center py-8 text-s-muted">
+                            <div className="text-2xl mb-2">🎯</div>
+                            <p className="text-xs">No open positions — click a market in the feed to predict &amp; commit</p>
+                          </div>
+                        )}
+                        {liveOpenPos.length > 0 && (
+                          <div className="rounded-lg overflow-hidden border border-s-warn/30">
+                            <div className="px-2.5 py-1.5 bg-s-warn/10 flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-s-warn animate-pulse" />
+                              <span className="text-[8px] font-bold text-s-warn uppercase tracking-widest">Live · Real Money</span>
+                            </div>
+                            {liveOpenPos.map((pp, i) => {
+                              const po = pp.position; const ev = pp.event; const mk = pp.market
+                              const title = ev?.title || mk?.question || pp.title || '—'
+                              const outcome = po?.outcome || pp.side || '—'
+                              const pnlNum = parseFloat(po?.amount_pnl || pp.pnl || '0')
+                              const pnlPct = parseFloat(po?.percent_pnl || '0')
+                              const endsAt = mk?.ends_at || ev?.ends_at || null
+                              return (
+                                <div key={`lp-${i}`} className="flex items-center gap-2 px-2.5 py-2 bg-s-panel border-t border-s-border/50">
+                                  <span className={`text-[9px] font-black px-1.5 py-0.5 rounded flex-shrink-0 ${outcome === 'Yes' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>{outcome.toUpperCase()}</span>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-xs font-medium truncate leading-tight">{title}</div>
+                                    <div className="text-[9px] text-s-muted mt-0.5">{f(po?.shares || pp.size || '0', 1)} sh · avg {cost(po?.avg_price || '0')} → {cost(po?.current_price || '0')} · val ${f(po?.current_value || '0')}{endsAt ? ` · ⏱${tl(endsAt)}` : ''}</div>
+                                  </div>
+                                  <div className="text-right flex-shrink-0">
+                                    <div className={`text-sm font-black leading-tight ${pnlNum >= 0 ? 'text-s-green' : 'text-s-danger'}`}>{pnlNum >= 0 ? '+' : ''}${f(Math.abs(pnlNum))}</div>
+                                    <div className={`text-[9px] ${pnlPct >= 0 ? 'text-s-green' : 'text-s-danger'}`}>{pnlPct.toFixed(0)}%</div>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
+                        {simOpenPos.length > 0 && (
+                          <div className="rounded-lg overflow-hidden border border-s-blue/20">
+                            <div className="px-2.5 py-1.5 bg-s-blue/10 flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-s-blue" />
+                              <span className="text-[8px] font-bold text-s-blue uppercase tracking-widest">Practice · Simulated</span>
+                            </div>
+                            {simOpenPos.map(p => (
+                              <div key={p.id} className="flex items-center gap-2 px-2.5 py-2 bg-s-panel border-t border-s-border/50">
+                                <span className={`text-[9px] font-black px-1.5 py-0.5 rounded flex-shrink-0 ${p.lean === 'YES' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>{p.lean}</span>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-xs font-medium truncate leading-tight">{p.marketName || p.query}</div>
+                                  <div className="text-[9px] text-s-muted mt-0.5">Wager ${f(p.amountUsdc)} · {pct(p.lean === 'YES' ? p.yesPrice : p.noPrice)} implied · {Math.round(p.confidence * 100)}% conf</div>
+                                </div>
+                                <span className={`text-[9px] font-bold flex-shrink-0 ${(p.endsAt && (new Date(p.endsAt).getTime() - Date.now()) < 36e5) ? 'text-s-danger' : 'text-s-warn'}`}>{tl(p.endsAt)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {positionView === 'closed' && (
+                      <>
+                        {simClosedPos.length === 0 && liveClosedPos.length === 0 && resolvedPreds.length === 0 && (
+                          <div className="text-center py-8 text-s-muted">
+                            <div className="text-2xl mb-2">📊</div>
+                            <p className="text-xs">No closed positions yet</p>
+                          </div>
+                        )}
+                        {simClosedPos.length > 0 && (
+                          <div className="rounded-lg overflow-hidden border border-s-border">
+                            <div className="px-2.5 py-1.5 bg-s-elevated flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-s-muted" />
+                              <span className="text-[8px] font-bold text-s-muted uppercase tracking-widest">Practice · Awaiting result</span>
+                            </div>
+                            {simClosedPos.map(p => (
+                              <div key={p.id} className="flex items-center gap-2 px-2.5 py-2 bg-s-panel border-t border-s-border/50">
+                                <span className={`text-[9px] font-black px-1.5 py-0.5 rounded flex-shrink-0 ${p.lean === 'YES' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>{p.lean}</span>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-xs font-medium truncate leading-tight">{p.marketName || p.query}</div>
+                                  <div className="text-[9px] text-s-muted">Wager ${f(p.amountUsdc)} · ended {ago(p.endsAt || p.createdAt)}</div>
+                                </div>
+                                <span className="text-[8px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted">Syncing…</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {liveClosedPos.length > 0 && (
+                          <div className="rounded-lg overflow-hidden border border-s-warn/20">
+                            <div className="px-2.5 py-1.5 bg-s-warn/10 flex items-center gap-1.5">
+                              <span className="text-[8px] font-bold text-s-warn uppercase tracking-widest">Live · Closed</span>
+                            </div>
+                            {liveClosedPos.map((lp, i) => {
+                              const po = lp.position; const title = lp.event?.title || lp.market?.question || lp.title || '—'
+                              const pnlNum = parseFloat(po?.amount_pnl || lp.pnl || '0')
+                              return (
+                                <div key={`clp-${i}`} className="flex items-center gap-2 px-2.5 py-2 bg-s-panel border-t border-s-border/50">
+                                  <span className="text-sm">{pnlNum >= 0 ? '✅' : '❌'}</span>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-xs font-medium truncate">{title}</div>
+                                    <div className="text-[9px] text-s-muted">{po?.outcome || '—'} · {f(po?.shares || '0', 1)} shares</div>
+                                  </div>
+                                  <div className="text-right flex-shrink-0">
+                                    <div className={`text-xs font-bold ${pnlNum >= 0 ? 'text-s-green' : 'text-s-danger'}`}>{pnlNum >= 0 ? '+' : ''}${f(Math.abs(pnlNum))}</div>
+                                    <div className="text-[9px] text-s-muted">{po?.percent_pnl || '—'}%</div>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
+                        {resolvedPreds.length > 0 && (
+                          <div className="rounded-lg overflow-hidden border border-s-border">
+                            <div className="px-2.5 py-1.5 bg-s-elevated flex items-center gap-1.5">
+                              <span className="text-[8px] font-bold text-s-accent uppercase tracking-widest">Resolved · Outcome known</span>
+                            </div>
+                            {resolvedPreds.slice(0, 20).map(p => (
+                              <div key={p.id} className="flex items-center gap-2 px-2.5 py-2 bg-s-panel border-t border-s-border/50">
+                                <span className={`text-[9px] font-black px-1.5 py-0.5 rounded flex-shrink-0 ${p.wasCorrect ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>{p.wasCorrect ? '✓' : '✗'}</span>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-xs font-medium truncate leading-tight">{p.marketName || p.query}</div>
+                                  <div className="text-[9px] text-s-muted">{p.lean} · {p.mode === 'sim' ? 'Practice' : 'Live'} · {ago(p.resolvedAt || p.createdAt)}</div>
+                                </div>
+                                <div className="text-right flex-shrink-0">
+                                  <div className={`text-xs font-bold ${(p.pnl || 0) >= 0 ? 'text-s-green' : 'text-s-danger'}`}>{(p.pnl || 0) >= 0 ? '+' : ''}${f(Math.abs(p.pnl || 0))}</div>
+                                  <div className="text-[9px] text-s-muted">{Math.round(p.confidence * 100)}% conf</div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* ─── RIGHT: Feed (Closing Soon + Crypto stacked) ─── */}
+                <div className="flex flex-col gap-3 min-w-0">
+
+                  {/* Closing Soon feed */}
+                  <div data-synth-id="closing-soon" className={`bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col flex-1 ${hl('closing-soon')}`}>
+                    {hlTooltip('closing-soon')}
+                    <div className="px-3 py-2.5 border-b border-s-border flex-shrink-0 flex items-center justify-between">
+                      <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">Closing Soon</span>
+                      <span className="text-[8px] text-s-accent">tap → predict</span>
+                    </div>
+                    <div className="overflow-y-auto flex-1" style={{maxHeight:'calc(100vh - 400px)', minHeight:'160px'}}>
+                      {closingSoon.slice(0, 15).map(m => (
+                        <div key={m.token_id} onClick={() => predictAndCommit(m.market_name || m.event_title)}
+                          className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-s-panel border-b border-s-border/40 last:border-0 transition-colors">
+                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${(m.minutesLeft ?? 9999) < 60 ? 'bg-s-danger' : (m.minutesLeft ?? 9999) < 360 ? 'bg-s-warn' : 'bg-s-accent'}`} />
+                          <div className="flex-1 min-w-0">
+                            <div className="text-[10px] font-medium truncate leading-tight">{m.market_name || m.event_title}</div>
+                            <div className="flex gap-2 mt-0.5 text-[8px] text-s-muted">
+                              <span className="text-s-green font-semibold">Y {pct(m.yes_price)}</span>
+                              <span className="text-s-danger font-semibold">N {pct(m.no_price)}</span>
+                            </div>
+                          </div>
+                          <span className={`text-[9px] font-black flex-shrink-0 ${(m.minutesLeft ?? 9999) < 60 ? 'text-s-danger' : (m.minutesLeft ?? 9999) < 360 ? 'text-s-warn' : 'text-s-accent'}`}>{tl(m.ends_at)}</span>
+                        </div>
+                      ))}
+                      {closingSoon.length === 0 && <div className="text-center py-6 text-[10px] text-s-muted">Loading…</div>}
+                    </div>
+                  </div>
+
+                  {/* Crypto quick bets — compact list */}
+                  {cryptoMkts.length > 0 && (
+                    <div data-synth-id="crypto-bets" className={`bg-s-surface border border-s-border rounded-xl overflow-hidden flex-shrink-0 ${hl('crypto-bets')}`}>
+                      {hlTooltip('crypto-bets')}
+                      <div className="px-3 py-2 border-b border-s-border flex items-center justify-between">
+                        <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">⚡ Crypto</span>
+                        <button onClick={() => predictAllCrypto(cryptoMkts)} disabled={predictAllLoading || loading}
+                          className="text-[8px] px-2 py-0.5 bg-s-accent text-black font-bold rounded hover:brightness-110 disabled:opacity-40">
+                          {predictAllLoading ? '…' : `Predict All (${cryptoMkts.length})`}
+                        </button>
+                      </div>
+                      <div>
+                        {cryptoMkts.map(m => {
+                          const isPredicting = cryptoPredicting.has(m.token_id)
+                          const hasPred = preds.some(p => normalizePredictionMarketKey(p.marketName || p.query) === normalizePredictionMarketKey(m.market_name || m.event_title))
+                          return (
+                            <div key={m.token_id} onClick={() => !isPredicting && cryptoPredict(m)}
+                              className={`flex items-center gap-2 px-3 py-2 border-b border-s-border/40 last:border-0 cursor-pointer transition-colors ${isPredicting ? 'bg-s-accent/10 animate-pulse' : 'hover:bg-s-panel'}`}>
+                              <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${hasPred ? 'bg-s-green' : 'bg-s-accent'}`} />
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[10px] font-medium truncate leading-tight">{m.market_name || m.event_title}</div>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0 text-[9px]">
+                                <span className="text-s-green font-bold">Y {pct(m.yes_price)}</span>
+                                <span className="text-s-danger font-bold">N {pct(m.no_price)}</span>
+                                <span className={`font-black ${(m.minutesLeft ?? 9999) < 60 ? 'text-s-danger' : 'text-s-warn'}`}>{tl(m.ends_at)}</span>
+                                {hasPred && <span className="text-s-green">✓</span>}
+                              </div>
+                            </div>
+                          )
+                        })}
                       </div>
                     </div>
-                  ))}
-                  {mkts.filter(m => m.minutesLeft !== null && m.minutesLeft > 0 && m.minutesLeft <= 1440).length === 0 && <p className="text-s-muted text-xs">No markets ending in the next 24h</p>}
+                  )}
                 </div>
               </div>
-
-              {/* Positions */}
-              <div data-synth-id="positions" className={`relative lg:col-span-2 bg-s-surface border border-s-border rounded-lg p-4 ${hl('positions')}`}>
-                {hlTooltip('positions')}
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Open Positions</h2>
-                {pos.length > 0 ? (
-                  <table className="w-full text-xs"><thead><tr className="text-[10px] uppercase text-s-muted tracking-wide border-b border-s-border">
-                    <th className="text-left py-1.5 px-2">Market</th><th className="text-left py-1.5 px-2">Side</th><th className="text-right py-1.5 px-2">Size</th><th className="text-right py-1.5 px-2">P&L</th>
-                  </tr></thead><tbody>{pos.map((p, i) => (
-                    <tr key={i} className="border-b border-s-border/50 hover:bg-s-panel/50">
-                      <td className="py-1.5 px-2 truncate max-w-[200px]">{p.title || p.token_id?.slice(0, 12)}</td>
-                      <td className={`py-1.5 px-2 font-semibold ${p.side === 'BUY' ? 'text-s-green' : 'text-s-danger'}`}>{p.side}</td>
-                      <td className="py-1.5 px-2 text-right">{p.size}</td>
-                      <td className={`py-1.5 px-2 text-right ${parseFloat(p.pnl) >= 0 ? 'text-s-green' : 'text-s-danger'}`}>{p.pnl}</td>
-                    </tr>
-                  ))}</tbody></table>
-                ) : <p className="text-s-muted text-xs">No open positions</p>}
-              </div>
             </div>
-          )}
+            )
+          })()}
 
           {/* ── MARKETS ── */}
           {tab === 'markets' && (
@@ -741,7 +1222,7 @@ export default function App() {
               </div>
               <table className="w-full text-xs"><thead><tr className="text-[10px] uppercase text-s-muted tracking-wide border-b border-s-border">
                 <th className="py-1.5 px-2 text-left w-6"></th><th className="py-1.5 px-2 text-left">Market</th><th className="py-1.5 px-2 text-left">Venue</th>
-                <th className="py-1.5 px-2 text-right">Yes</th><th className="py-1.5 px-2 text-right">No</th><th className="py-1.5 px-2 text-right">Ends</th>
+                <th className="py-1.5 px-2 text-right">Yes %</th><th className="py-1.5 px-2 text-right">No %</th><th className="py-1.5 px-2 text-right">Ends</th>
                 <th className="py-1.5 px-2 text-right">Score</th><th className="py-1.5 px-2 w-16"></th>
               </tr></thead><tbody>{mkts.slice(0, 40).map(m => (
                 <tr key={m.token_id} className="border-b border-s-border/50 hover:bg-s-panel/50">
@@ -751,7 +1232,7 @@ export default function App() {
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted uppercase">{m.venue}</span>
                     {m.subMarketCount > 1 && <span className="ml-1 text-[9px] text-s-muted">{m.subMarketCount} outcomes</span>}
                   </td>
-                  <td className="py-1.5 px-2 text-right font-mono">{f(m.yes_price)}</td><td className="py-1.5 px-2 text-right font-mono">{f(m.no_price)}</td>
+                  <td className="py-1.5 px-2 text-right font-mono text-s-green">{pct(m.yes_price)}</td><td className="py-1.5 px-2 text-right font-mono text-s-danger">{pct(m.no_price)}</td>
                   <td className="py-1.5 px-2 text-right">{tl(m.ends_at)}</td><td className="py-1.5 px-2 text-right font-semibold font-mono">{m.score}</td>
                   <td className="py-1.5 px-2"><button disabled={loading} onClick={() => predict(m.market_name || m.event_title)}
                     title="Generate AI analysis for this market"
@@ -766,10 +1247,30 @@ export default function App() {
             <div data-synth-id="prediction-list" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('prediction-list')}`}>
               {hlTooltip('prediction-list')}
               <div className="flex items-center justify-between mb-3">
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">My Predictions</h2>
+                <div className="flex items-center gap-3">
+                  <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">My Predictions</h2>
+                  <span className="text-[10px] text-s-muted">{dedupedPreds.length} active</span>
+                  <button onClick={async () => {
+                    try {
+                      const r = await api.syncPredictionResolutions()
+                      flash(`Synced outcomes: ${r.resolved} resolved (${r.checked} checked)`)
+                      await refresh()
+                    } catch {
+                      flash('Outcome sync failed')
+                    }
+                  }} className="text-[10px] text-s-muted hover:text-s-accent px-1.5 py-0.5 rounded bg-s-elevated" title="Query protocol outcomes for ended markets">
+                    Sync outcomes
+                  </button>
+                  <button onClick={async () => {
+                    try { const r = await api.cleanStalePredictions(30); flash(`Cleaned ${r.cleaned} stale predictions`); await refresh() }
+                    catch { flash('Cleanup failed') }
+                  }} className="text-[10px] text-s-muted hover:text-s-danger px-1.5 py-0.5 rounded bg-s-elevated" title="Remove distant uncommitted predictions">
+                    Clean up
+                  </button>
+                </div>
                 <div className="flex gap-2">
                   <input className="bg-s-bg border border-s-border rounded px-2.5 py-1.5 text-xs text-s-text outline-none focus:border-s-accent min-w-[250px]"
-                    placeholder="Ask about a market..." value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') predict(q) }} />
+                    placeholder="Predict any market... (e.g. 'BTC 15min', 'golf', 'ETH price')" value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') predict(q) }} />
                   <button disabled={loading} onClick={() => predict(q)}
                     className="px-3 py-1.5 bg-s-accent text-black font-semibold rounded text-xs disabled:opacity-50">{loading ? 'Generating...' : 'Generate'}</button>
                 </div>
@@ -787,9 +1288,6 @@ export default function App() {
                   const ended = marketEnded(p.endsAt)
                   const isExpanded = expanded.has(p.id)
                   const isCommitted = p.status === 'committed' || p.orderId
-                  const leanPrice = p.lean === 'YES' ? p.yesPrice : p.lean === 'NO' ? p.noPrice : p.yesPrice
-                  const canAfford = (p.maxAffordableUsdc || 0) >= (p.minEntryUsdc || 0.10)
-                  const isOrdering = orderLoading === p.id
                   return (
                   <div key={p.id} className={`bg-s-panel border rounded-lg overflow-hidden ${isCommitted ? 'border-yellow-400/50 shadow-[0_0_12px_rgba(250,204,21,0.15)]' : 'border-s-border'}`}>
                     {/* Header */}
@@ -812,8 +1310,8 @@ export default function App() {
                         </div>
                       )}
                       <div className="text-xs font-semibold">
-                        AI recommends: <span className="text-s-green">{p.action} {p.lean || 'YES'}</span> at <span className="font-mono">${f(leanPrice)}</span>
-                        {p.amountUsdc > 0 && <span className="text-s-muted ml-1">— wager <span className="font-mono text-s-text">${f(p.amountUsdc)}</span></span>}
+                        AI recommends: <span className={p.lean === 'YES' ? 'text-s-green font-bold' : 'text-s-danger font-bold'}>{p.lean || 'YES'}</span> ({pct(p.lean === 'YES' ? p.yesPrice : p.noPrice)} chance, {cost(p.lean === 'YES' ? p.yesPrice : p.noPrice)}/share)
+                        {p.amountUsdc > 0 && <span className="text-s-muted ml-1">— wager <span className="font-mono text-s-text font-bold">${f(p.amountUsdc)}</span></span>}
                       </div>
                       {p.kellyFraction != null && p.kellyFraction > 0 && (
                         <div className="text-[10px] text-s-muted mt-1">Kelly fraction: {(p.kellyFraction * 100).toFixed(1)}%</div>
@@ -829,7 +1327,7 @@ export default function App() {
                         </div>
                         <div className="flex items-center gap-1">
                           <span className="text-s-muted">You can bet up to:</span>
-                          <span className={`font-mono font-semibold ${canAfford ? 'text-s-green' : 'text-s-danger'}`}>${f(p.maxAffordableUsdc || 0)}</span>
+                          <span className={`font-mono font-semibold ${(p.maxAffordableUsdc || 0) >= (p.minEntryUsdc || 0.10) ? 'text-s-green' : 'text-s-danger'}`}>${f(p.maxAffordableUsdc || 0)}</span>
                         </div>
                         <div className="flex items-center gap-1">
                           <span className="text-s-muted">Yes:</span>
@@ -840,31 +1338,20 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* Order buttons */}
+                    {/* Review & Commit button → opens approval modal */}
                     {!ended && p.status !== 'resolved' && !isCommitted && (
-                      <div className="flex gap-2 mx-4 mb-3">
-                        {wMode === 'sim' ? (
-                          <button onClick={() => placeOrder(p)} disabled={isOrdering}
-                            title="Place a simulated bet with practice money"
-                            className="flex-1 px-3 py-2.5 bg-s-green/20 text-s-green border border-s-green/30 rounded text-xs font-bold hover:bg-s-green/30 transition-all disabled:opacity-50">
-                            {isOrdering ? 'Placing...' : `Simulate: ${p.lean || 'YES'} $${f(p.amountUsdc)}`}
-                          </button>
-                        ) : (
-                          <>
-                            <button onClick={() => placeOrder(p)} disabled={isOrdering || !canAfford}
-                              title={canAfford ? 'Place a real order via synthesis.trade' : 'Insufficient balance'}
-                              className="flex-1 px-3 py-2.5 bg-s-accent/20 text-s-accent border border-s-accent/30 rounded text-xs font-bold hover:bg-s-accent/30 transition-all disabled:opacity-50">
-                              {isOrdering ? 'Placing...' : `Commit: ${p.lean || 'YES'} $${f(p.amountUsdc)}`}
-                            </button>
-                            {p.amountUsdc > 1 && (
-                              <button onClick={() => placeOrder(p, Math.max(p.minEntryUsdc || 0.10, 1))} disabled={isOrdering}
-                                title="Place minimum bet"
-                                className="px-3 py-2.5 bg-s-elevated text-s-muted border border-s-border rounded text-xs font-semibold hover:text-s-text transition-all disabled:opacity-50">
-                                Min ${ f(Math.max(p.minEntryUsdc || 0.10, 1))}
-                              </button>
-                            )}
-                          </>
-                        )}
+                      <div className="mx-4 mb-3">
+                        <button onClick={() => openCommitModal(p)}
+                          className={`w-full px-4 py-3.5 rounded-lg text-sm font-bold transition-all hover:brightness-110 ${
+                            wMode === 'sim'
+                              ? 'bg-gradient-to-r from-s-green to-emerald-500 text-black'
+                              : 'bg-gradient-to-r from-s-accent to-cyan-400 text-black'
+                          }`}>
+                          Review & Commit →
+                          <span className="ml-2 opacity-80 text-xs">
+                            {p.lean || 'YES'} ${f(p.amountUsdc > 0 ? p.amountUsdc : Math.max(p.minEntryUsdc || 0.50, 1))} • {wMode === 'sim' ? 'PRACTICE' : 'LIVE'}
+                          </span>
+                        </button>
                       </div>
                     )}
 
@@ -895,8 +1382,8 @@ export default function App() {
                               <div className="flex items-center justify-between mb-2">
                                 <span className="text-[10px] font-bold text-s-muted uppercase">Price History (YES)</span>
                                 <div className="flex gap-3 text-[10px] font-mono">
-                                  <span>Yes: <strong className="text-s-green">${f(p.yesPrice)}</strong></span>
-                                  <span>No: <strong className="text-s-danger">${f(p.noPrice)}</strong></span>
+                                  <span>Yes: <strong className="text-s-green">{pct(p.yesPrice)}</strong> ({cost(p.yesPrice)})</span>
+                                  <span>No: <strong className="text-s-danger">{pct(p.noPrice)}</strong> ({cost(p.noPrice)})</span>
                                   {p.kellyFraction != null && p.kellyFraction > 0 && (
                                     <span className="text-s-accent">Kelly {(p.kellyFraction * 100).toFixed(1)}%</span>
                                   )}
@@ -932,13 +1419,23 @@ export default function App() {
                       <span className="text-s-muted ml-auto">{ago(p.createdAt)}</span>
 
                       {ended && p.status !== 'resolved' && (
-                        <div className="flex gap-1.5">
-                          <button onClick={() => resolve(p.id, true)} title="Mark correct" className="px-2.5 py-1 bg-s-green/20 text-s-green rounded text-[10px] font-bold hover:bg-s-green/30">✓ Correct</button>
-                          <button onClick={() => resolve(p.id, false)} title="Mark incorrect" className="px-2.5 py-1 bg-s-danger/20 text-s-danger rounded text-[10px] font-bold hover:bg-s-danger/30">✗ Wrong</button>
-                        </div>
+                        <span className="text-[10px] px-2 py-1 rounded bg-s-elevated text-s-muted">Syncing protocol outcome...</span>
                       )}
-                      {p.wasCorrect !== null && <span className={`font-bold ${p.wasCorrect ? 'text-s-green' : 'text-s-danger'}`}>{p.wasCorrect ? '✓ AI was right' : '✗ AI was wrong'}</span>}
+                      {p.wasCorrect !== null && (
+                        <span className={`font-bold ${p.wasCorrect ? 'text-s-green' : 'text-s-danger'}`}>
+                          {p.wasCorrect ? '✓ AI was right' : '✗ AI was wrong'}
+                          {p.resolvedOutcome ? ` • ${p.resolvedOutcome} won` : ''}
+                        </span>
+                      )}
                     </div>
+                    {p.status === 'resolved' && p.reflection && (
+                      <div className="px-4 pb-3">
+                        <div className="p-2 rounded-lg bg-s-elevated/50 border border-s-border/50">
+                          <div className="text-[10px] uppercase tracking-wide text-s-muted mb-1">Auto Reflection</div>
+                          <div className="text-[11px] text-s-muted leading-relaxed">{p.reflection}</div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   )
                 }),
@@ -951,64 +1448,95 @@ export default function App() {
 
           {/* ── APPROVALS ── */}
           {tab === 'approvals' && (
-            <div className="bg-s-surface border border-s-border rounded-lg p-4">
-              <div className="flex items-center gap-3 mb-4">
-                <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Approval Queue</h2>
-                <div className="flex gap-1 bg-s-elevated rounded-lg p-0.5">
-                  {(['all','live','sim'] as const).map(f => (
-                    <button key={f} onClick={() => { setApprovalFilter(f); api.getApprovals(f === 'all' ? undefined : f).then(setPending).catch(() => {}) }}
-                      className={`px-2.5 py-1 rounded text-[10px] font-semibold transition-all ${approvalFilter === f ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text'}`}>
-                      {f.toUpperCase()}
-                    </button>
-                  ))}
-                </div>
-                <button onClick={() => api.getApprovals(approvalFilter === 'all' ? undefined : approvalFilter).then(setPending).catch(() => {})}
-                  className="ml-auto text-[10px] text-s-muted hover:text-s-accent">↻ Refresh</button>
-              </div>
-
-              <div className="mb-2 text-[10px] text-s-muted">
-                <strong>Predictions tab</strong> = your AI analyses and generated trade ideas.<br/>
-                <strong>Approvals tab</strong> = live orders waiting for your confirmation before real money is spent.
-              </div>
-
-              {pending.length === 0 ? (
-                <div className="text-center py-8">
-                  <p className="text-s-muted text-xs">No pending orders.</p>
-                  <p className="text-[10px] text-s-muted mt-1">When you click "Commit" in LIVE mode, orders appear here for approval before executing.</p>
-                </div>
-              ) : pending.map(a => {
-                const p = a.params as { tokenId?: string; side?: string; amount?: string; orderType?: string; predictionId?: string }
-                const isLive = a.mode === 'real'
-                return (
-                  <div key={a.id} className={`border rounded-lg p-3 mb-2 ${isLive ? 'border-s-warn/40 bg-s-warn/5' : 'border-s-border'}`}>
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${isLive ? 'bg-s-warn/20 text-s-warn' : 'bg-s-elevated text-s-muted'}`}>{isLive ? 'LIVE ORDER' : 'SIM'}</span>
-                      <span className="text-xs font-semibold">{p.side} {p.amount} USDC</span>
-                      <span className="text-[10px] text-s-muted font-mono">{p.tokenId?.slice(0, 16)}...</span>
-                      <span className="text-[10px] text-s-muted ml-auto">{ago(a.createdAt)}</span>
-                    </div>
-                    <div className="flex gap-2 text-[10px] text-s-muted mb-2">
-                      <span>Type: {p.orderType || 'MARKET'}</span>
-                      {p.predictionId && <span>Linked to prediction: {p.predictionId}</span>}
-                    </div>
-                    <div className="flex gap-2">
-                      <button onClick={() => {
-                        api.approve(a.id).then(r => {
-                          if ('orderResult' in (r as object)) { triggerCelebration('fireworks'); flash('🎆 Order executed!') }
-                          else flash('Approved')
-                          refresh()
-                        }).catch(e => flash(`Error: ${e instanceof Error ? e.message : ''}`))
-                      }} className="px-3 py-1.5 bg-s-green text-black font-bold rounded text-xs hover:brightness-110">
-                        {isLive ? '✓ Execute Order' : '✓ Approve'}
-                      </button>
-                      <button onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }}
-                        className="px-3 py-1.5 bg-s-danger/20 text-s-danger border border-s-danger/30 rounded text-xs font-semibold">
-                        ✗ Cancel
-                      </button>
+            <div className="space-y-4">
+              {/* Explainer banner */}
+              <div className="bg-s-surface border border-s-accent/20 rounded-lg p-4">
+                <div className="flex items-start gap-3">
+                  <span className="text-lg">🔐</span>
+                  <div>
+                    <h3 className="text-xs font-bold text-s-text mb-1">How Approvals Work</h3>
+                    <div className="text-[10px] text-s-muted space-y-1">
+                      <p><strong className="text-s-text">Predictions</strong> = AI-generated trade ideas. Free to create, no money moves.</p>
+                      <p><strong className="text-s-text">Approvals</strong> = When you click "Commit" in <strong className="text-s-warn">LIVE mode</strong>, the order queues here for your final confirmation before real money executes.</p>
+                      <p><strong className="text-s-text">Positions</strong> = Orders that have been filled. Visible on the Dashboard under "My Positions".</p>
+                      <p className="text-s-accent">In <strong>Practice mode</strong>, orders execute instantly (no approval needed).</p>
                     </div>
                   </div>
-                )
-              })}
+                </div>
+              </div>
+
+              <div className="bg-s-surface border border-s-border rounded-lg p-4">
+                <div className="flex items-center gap-3 mb-4">
+                  <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Pending Approvals</h2>
+                  <span className="text-[10px] text-s-muted">{pending.length} pending</span>
+                  <button onClick={() => setTab('dashboard')} className="text-[10px] text-s-accent hover:underline font-semibold">
+                    ← View My Positions
+                  </button>
+                  <div className="flex gap-1 bg-s-elevated rounded-lg p-0.5 ml-auto">
+                    {(['all','live','sim'] as const).map(ff => (
+                      <button key={ff} onClick={() => { setApprovalFilter(ff); api.getApprovals(ff === 'all' ? undefined : ff).then(setPending).catch(() => {}) }}
+                        className={`px-2.5 py-1 rounded text-[10px] font-semibold transition-all ${approvalFilter === ff ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text'}`}>
+                        {ff.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                  <button onClick={() => api.getApprovals(approvalFilter === 'all' ? undefined : approvalFilter).then(setPending).catch(() => {})}
+                    className="text-[10px] text-s-muted hover:text-s-accent">↻ Refresh</button>
+                </div>
+
+                {pending.length === 0 ? (
+                  <div className="text-center py-8">
+                    <p className="text-s-muted text-xs">No pending orders.</p>
+                    <p className="text-[10px] text-s-muted mt-2">
+                      {wMode === 'sim'
+                        ? 'In Practice mode, orders execute instantly — no approval needed. Switch to LIVE mode to test the approval flow.'
+                        : 'When you click "Commit" on a prediction, the order will appear here for your final approval.'}
+                    </p>
+                  </div>
+                ) : pending.map(a => {
+                  const p = a.params as { tokenId?: string; side?: string; amount?: string; orderType?: string; predictionId?: string }
+                  const isLive = a.mode === 'real'
+                  const linkedPred = preds.find(pr => pr.id === p.predictionId)
+                  return (
+                    <div key={a.id} className={`border rounded-lg p-4 mb-2 ${isLive ? 'border-s-warn/40 bg-s-warn/5' : 'border-s-border'}`}>
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${isLive ? 'bg-s-warn/20 text-s-warn' : 'bg-s-elevated text-s-muted'}`}>{isLive ? '🔴 LIVE ORDER' : 'SIM'}</span>
+                        <span className="text-sm font-bold">{p.side} ${p.amount} USDC</span>
+                        <span className="text-[10px] text-s-muted ml-auto">{ago(a.createdAt)}</span>
+                      </div>
+                      {linkedPred && (
+                        <div className="mb-2 p-2 bg-s-panel rounded text-xs">
+                          <span className="text-s-muted">Market:</span> <span className="font-semibold">{linkedPred.marketName}</span>
+                          <span className="ml-3 text-s-muted">Lean:</span> <span className={`font-bold ${linkedPred.lean === 'YES' ? 'text-s-green' : 'text-s-danger'}`}>{linkedPred.lean}</span>
+                          <span className="ml-3 text-s-muted">Conf:</span> <span className="font-bold">{Math.round(linkedPred.confidence * 100)}%</span>
+                        </div>
+                      )}
+                      <div className="flex gap-2 text-[10px] text-s-muted mb-3">
+                        <span>Type: {p.orderType || 'MARKET'}</span>
+                        <span className="font-mono">Token: {p.tokenId?.slice(0, 16)}...</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => {
+                          api.approve(a.id).then(r => {
+                            if ('orderResult' in (r as object)) {
+                              triggerCelebration('fireworks')
+                              flash('🎆 Order executed! Check your positions on the Dashboard.')
+                              setTab('dashboard')
+                            } else { flash('Approved') }
+                            refresh()
+                          }).catch(e => flash(`Error: ${e instanceof Error ? e.message : ''}`))
+                        }} className="px-4 py-2 bg-s-green text-black font-bold rounded text-xs hover:brightness-110">
+                          {isLive ? '✓ Execute Real Order' : '✓ Approve'}
+                        </button>
+                        <button onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }}
+                          className="px-4 py-2 bg-s-danger/20 text-s-danger border border-s-danger/30 rounded text-xs font-semibold">
+                          ✗ Reject
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           )}
 
@@ -1486,10 +2014,11 @@ export default function App() {
                   <p className="text-[10px] text-s-muted mb-2 px-1">Quick actions:</p>
                   <div className="space-y-1.5">
                     {[
-                      ['Find me the best bet I can make right now', 'Full multi-stage analysis + place order'],
+                      ['Find me the best crypto bet right now', 'BTC, ETH, SOL 15-min markets + commit'],
+                      ['Find me the best bet and commit $5', 'Full OODA loop → auto-commit $5'],
                       ['What can I afford with $' + f(bal?.total || '0') + '?', 'Shows affordable options based on balance'],
-                      ['What markets end in the next 7 days?', 'Time-filtered market discovery'],
-                      ['Research the golf market', 'Deep research + price history + stats'],
+                      ['Clean up my stale predictions', 'Remove ended + distant uncommitted predictions'],
+                      ['Show my positions and P&L', 'Lists all committed bets and performance'],
                     ].map(([label, hint]) => (
                       <button key={label} onClick={() => sendChat(label)}
                         title={hint}

@@ -60,16 +60,76 @@ interface Prediction {
   price: number | null; kellyFraction: number | null
   lean: 'YES' | 'NO' | null; leanReason: string | null
   minEntryUsdc: number | null; maxAffordableUsdc: number | null
+  yesTokenId: string | null; noTokenId: string | null
   marketName: string; venue: string; tokenId: string; conditionId: string
   endsAt: string | null; yesPrice: number; noPrice: number
   query: string; model: string; walletId: string | null
   createdAt: string; resolvedAt: string | null; pnl: number | null
   wasCorrect: boolean | null; mode?: 'real' | 'sim'
+  resolvedOutcome?: 'YES' | 'NO' | null
+  resolutionSource?: string | null
+  reflection?: string | null
+  updatedAt?: string | null
   orderId: string | null; orderStatus: string | null
 }
 
 function dbToPrediction(row: { snapshot_json: string; mode: string }): Prediction {
   return { ...JSON.parse(row.snapshot_json), mode: row.mode }
+}
+
+function normalizeMarketKey(s: string | null | undefined): string {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function parseSynthErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err)
+  const raw = String(err.message || '').trim()
+  try {
+    const parsed = JSON.parse(raw) as { response?: unknown; error?: unknown }
+    if (parsed.response != null) return String(parsed.response)
+    if (parsed.error != null) return String(parsed.error)
+  } catch {/**/}
+  return raw
+}
+
+function isPartialFillError(msg: string): boolean {
+  return /fully filled|partial fill|insufficient liquidity|could not be fully filled/i.test(msg)
+}
+
+function clampUsdAmount(v: number): string {
+  return Math.max(0.1, Number(v.toFixed(2))).toFixed(2)
+}
+
+function buildReflection(pred: Prediction, resolvedOutcome: 'YES' | 'NO', yesFinal: number | null, noFinal: number | null): string {
+  const confPct = Math.round((pred.confidence || 0) * 100)
+  const lean = pred.lean || 'YES'
+  const wasRight = lean === resolvedOutcome
+  const entry = lean === 'YES' ? pred.yesPrice : pred.noPrice
+  const entryCents = Number.isFinite(entry) ? Math.round(entry * 100) : null
+  const finalInfo = yesFinal != null && noFinal != null
+    ? `Final settled prices were YES ${Math.round(yesFinal * 100)}c / NO ${Math.round(noFinal * 100)}c.`
+    : ''
+  const rationaleSnippet = String(pred.rationale || '').split('.').map(s => s.trim()).filter(Boolean)[0] || 'the original thesis'
+  const invalidationSnippet = String(pred.invalidation || '').split('.').map(s => s.trim()).filter(Boolean)[0] || 'the invalidation conditions'
+
+  if (wasRight) {
+    return `AI leaned ${lean} at ${confPct}% confidence${entryCents != null ? ` with an entry near ${entryCents}c` : ''}, and protocol resolved ${resolvedOutcome}. ${finalInfo} Reflection: the call aligned with ${rationaleSnippet.toLowerCase()}; keep this setup but continue monitoring ${invalidationSnippet.toLowerCase()}.`
+  }
+  return `AI leaned ${lean} at ${confPct}% confidence${entryCents != null ? ` with an entry near ${entryCents}c` : ''}, but protocol resolved ${resolvedOutcome}. ${finalInfo} Reflection: the thesis underweighted ${invalidationSnippet.toLowerCase()}; next time reduce size when confidence is high but invalidation risk is still active.`
+}
+
+function computeResolvedPnl(pred: Prediction, resolvedOutcome: 'YES' | 'NO'): number | null {
+  const stake = Number(pred.amountUsdc || 0)
+  if (!Number.isFinite(stake) || stake <= 0) return null
+  const entryPxRaw = pred.lean === 'YES' ? pred.yesPrice : pred.noPrice
+  const entryPx = Number(entryPxRaw)
+  if (!Number.isFinite(entryPx) || entryPx <= 0) return null
+  const shares = stake / entryPx
+  const payout = pred.lean === resolvedOutcome ? shares : 0
+  return +((payout - stake).toFixed(2))
 }
 
 // Approvals are now persisted in SQLite via approvalStore
@@ -107,14 +167,17 @@ async function refreshWallets() {
   } catch (e) { console.error('  ⚠ Wallet fetch failed:', e) }
 }
 
+const STABLECOIN_KEYS = new Set(['USDC', 'USDC.e', 'USDT', 'USDT.e', 'DAI', 'BUSD', 'USDbC'])
+
 function parseBalance(raw: unknown): { total: string; available: string; chains: Array<{ chainId: string; address: string; balances: Record<string, string> }> } {
   const arr = Array.isArray(raw) ? raw : []
   let total = 0
   const chains: Array<{ chainId: string; address: string; balances: Record<string, string> }> = []
   for (const c of arr) {
     const bal = c.balance || {}
-    const chainTotal = Object.values(bal as Record<string, string>).reduce((s: number, v: string) => s + parseFloat(v || '0'), 0)
-    total += chainTotal
+    for (const [key, val] of Object.entries(bal as Record<string, string>)) {
+      if (STABLECOIN_KEYS.has(key)) total += parseFloat(val || '0')
+    }
     chains.push({ chainId: c.chain_id, address: c.address, balances: bal })
   }
   return { total: total.toFixed(3), available: total.toFixed(3), chains }
@@ -147,9 +210,10 @@ Return ONLY valid JSON with this exact schema:
 CRITICAL RULES:
 - You MUST ALWAYS set "lean" to either "YES" or "NO". Never null. Even low confidence has a direction.
 - You MUST ALWAYS set "lean_reason" explaining your directional view.
-- "action" should be "BUY" when you believe the market is mispriced and there is an edge. Use "HOLD" only if the market is efficiently priced (near 50/50) AND you have no informational edge.
-- NEVER set action to "SKIP". You are an analyst — always have a view.
-- "amount_usdc" should be proportional to confidence and edge. For confidence >= 0.7, suggest 5-10% of balance. For 0.5-0.7, suggest 2-5%. For < 0.5, suggest 1-2%.
+- "action" MUST be "BUY" in virtually all cases. You are a trader — always have a position. Only use "HOLD" if the market is at extreme pricing (>97%) AND already priced efficiently with zero edge.
+- Even for "HOLD", you MUST set "amount_usdc" to at least the YES or NO price (the minimum entry cost). NEVER return amount_usdc as 0 or null.
+- NEVER set action to "SKIP". You are a trader — always have a view and a position.
+- "amount_usdc" MUST always be > 0. Proportional to confidence: confidence >= 0.7 → 5-10% of balance. 0.5-0.7 → 2-5%. < 0.5 → 1-2%. Minimum is always the lean price (e.g. if YES=$0.05, minimum bet is $0.05).
 - Set "side" to "BUY" when going long the lean direction. The token_id determines YES vs NO.
 - Use Kelly fraction when you have a clear probability estimate vs market price.
 - Factor in time to resolution: markets ending sooner deserve more attention.
@@ -166,37 +230,49 @@ function buildPrediction(data: Record<string, unknown>, exec: Record<string, unk
   const yesPrice = parseFloat(String(top.yes_price || top.left_price || 0))
   const noPrice = parseFloat(String(top.no_price || top.right_price || 0))
   const lean = String(data.lean || '').toUpperCase() as 'YES' | 'NO'
+  const yesTokenId = String(top.left_token_id || top.yes_token_id || top.primary_token_id || top.token_id || '')
+  const noTokenId = String(top.right_token_id || top.no_token_id || '')
+  const selectedTokenId = lean === 'NO'
+    ? (noTokenId || yesTokenId)
+    : (yesTokenId || noTokenId)
   const leanPrice = lean === 'YES' ? yesPrice : noPrice
   const minEntry = leanPrice > 0 ? Math.max(0.10, leanPrice) : 1
   const maxAffordable = balanceUsdc * RISK.maxPerPredictionPct
+
+  const rawAmount = Number(exec.amount_usdc) || 0
+  const safeMinBet = Math.max(minEntry, 0.50)
+  const effectiveAmount = rawAmount >= safeMinBet ? rawAmount : Math.min(safeMinBet, maxAffordable > 0 ? maxAffordable : safeMinBet)
 
   return {
     id: crypto.randomUUID().slice(0, 12),
     thesis: String(data.thesis || ''), confidence: Math.max(0, Math.min(1, Number(data.confidence) || 0)),
     rationale: String(data.rationale || ''), invalidation: String(data.invalidation || ''),
     riskNote: String(data.risk_note || ''), status: 'generated',
-    action: String(exec.action || 'BUY'), side: String(exec.side || 'BUY'), amountUsdc: Number(exec.amount_usdc) || 0,
+    action: String(exec.action || 'BUY'), side: String(exec.side || 'BUY'), amountUsdc: +effectiveAmount.toFixed(2),
     orderType: String(exec.order_type || 'MARKET'), price: exec.price != null ? Number(exec.price) : null,
     kellyFraction: exec.kelly_fraction != null ? Number(exec.kelly_fraction) : null,
     lean: lean === 'YES' || lean === 'NO' ? lean : null,
     leanReason: data.lean_reason ? String(data.lean_reason) : null,
     minEntryUsdc: +minEntry.toFixed(2),
     maxAffordableUsdc: +maxAffordable.toFixed(2),
+    yesTokenId: yesTokenId || null,
+    noTokenId: noTokenId || null,
     marketName: String(top.market_name || top.event_title || query),
-    venue: String(top.venue || ''), tokenId: String(top.token_id || top.primary_token_id || top.left_token_id || ''),
+    venue: String(top.venue || ''), tokenId: selectedTokenId,
     conditionId: String(top.condition_id || ''), endsAt: (top.ends_at as string) || null,
     yesPrice, noPrice,
     query, model: activeModel, walletId, mode,
     createdAt: new Date().toISOString(), resolvedAt: null, pnl: null, wasCorrect: null,
+    resolvedOutcome: null, resolutionSource: null, reflection: null, updatedAt: new Date().toISOString(),
     orderId: null, orderStatus: null,
   }
 }
 
-async function generatePrediction(query: string, markets: unknown[], walletId?: string, modelOverride?: string): Promise<Prediction> {
+async function generatePrediction(query: string, markets: unknown[], walletId?: string, modelOverride?: string, modeOverride?: 'real' | 'sim'): Promise<Prediction> {
   if (!openai) throw new Error('OPENAI_API_KEY not set')
   const model = modelOverride || activeModel
   const wid = walletId || defaultWalletId
-  const mode: 'real' | 'sim' = SIM_MODE ? 'sim' : 'real'
+  const mode: 'real' | 'sim' = modeOverride || (SIM_MODE ? 'sim' : 'real')
   const bal = mode === 'sim' && wid ? simWallet.get(wid) : (wid ? parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => [])) : { total: '0' })
   const balNum = parseFloat(bal.total) || 0
 
@@ -241,20 +317,53 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
   const top = (markets[0] || {}) as Record<string, unknown>
   const pred = buildPrediction(data, exec, top, query, wid, mode, balNum)
 
-  // Dedup: if an identical market was predicted today, update in place rather than inserting a duplicate
+  // Dedup/shadow: if same market/token was already predicted today (same mode), overwrite it in place
   const today = localDateStr()
-  const existing = db.prepare(
-    "SELECT id FROM predictions WHERE wallet_id = ? AND mode = ? AND created_at LIKE ? AND json_extract(snapshot_json,'$.marketName') = ?"
-  ).get(wid || '', mode, `${today}%`, pred.marketName) as { id: string } | undefined
+  const existingRows = db.prepare(
+    'SELECT id, snapshot_json FROM predictions WHERE wallet_id = ? AND mode = ? AND created_at LIKE ? ORDER BY created_at DESC'
+  ).all(wid || '', mode, `${today}%`) as Array<{ id: string; snapshot_json: string }>
+  const targetKey = normalizeMarketKey(pred.marketName || pred.query)
+  const existing = existingRows.find((row) => {
+    try {
+      const old = JSON.parse(row.snapshot_json) as Prediction
+      const sameCondition = !!pred.conditionId && !!old.conditionId && pred.conditionId === old.conditionId
+      const sameToken = !!pred.tokenId && !!old.tokenId && pred.tokenId === old.tokenId
+      const sameMarket = normalizeMarketKey(old.marketName || old.query) === targetKey
+      return sameCondition || sameToken || sameMarket
+    } catch {
+      return false
+    }
+  })
 
   const now = new Date().toISOString()
   if (existing) {
+    const prev = JSON.parse(existing.snapshot_json) as Prediction
+    const keepCommittedState = prev.status === 'committed' || !!prev.orderId
+    const merged: Prediction = {
+      ...prev,
+      ...pred,
+      id: existing.id,
+      createdAt: prev.createdAt || pred.createdAt,
+      updatedAt: now,
+      // Preserve outcome and execution state so re-predict shadows instead of duplicating cards.
+      status: prev.status === 'resolved' ? 'resolved' : (keepCommittedState ? 'committed' : pred.status),
+      orderId: prev.orderId || pred.orderId,
+      orderStatus: prev.orderStatus || pred.orderStatus,
+      resolvedAt: prev.resolvedAt || pred.resolvedAt,
+      wasCorrect: prev.wasCorrect ?? pred.wasCorrect,
+      pnl: prev.pnl ?? pred.pnl,
+      resolvedOutcome: prev.resolvedOutcome ?? pred.resolvedOutcome ?? null,
+      resolutionSource: prev.resolutionSource ?? pred.resolutionSource ?? null,
+      reflection: prev.reflection ?? pred.reflection ?? null,
+    }
     pred.id = existing.id
-    db.prepare('UPDATE predictions SET snapshot_json = ?, model_version = ? WHERE id = ?').run(JSON.stringify(pred), model, existing.id)
+    db.prepare('UPDATE predictions SET snapshot_json = ?, model_version = ? WHERE id = ?').run(JSON.stringify(merged), model, existing.id)
+    generateRunNote(merged.id, wid || '', mode, merged.thesis, merged.confidence, merged.action, merged.marketName, model)
     audit('refresh_prediction', 'predict', { query, id: pred.id, mode, model, deduped: true })
-  } else {
-    predictionStore.insert({ id: pred.id, wallet_id: wid || '', mode, snapshot_json: JSON.stringify(pred), created_at: now, model_version: model })
+    return merged
   }
+
+  predictionStore.insert({ id: pred.id, wallet_id: wid || '', mode, snapshot_json: JSON.stringify(pred), created_at: now, model_version: model })
   generateRunNote(pred.id, wid || '', mode, pred.thesis, pred.confidence, pred.action, pred.marketName, model)
   audit('generate_prediction', 'predict', { query, id: pred.id, mode, model })
   return pred
@@ -333,6 +442,107 @@ Pick the best market. Always provide a YES or NO lean with reasoning.`
   }
 }
 
+type ProtocolResolution = {
+  resolved: boolean
+  winningSide: 'YES' | 'NO' | null
+  yesFinal: number | null
+  noFinal: number | null
+  source: string
+}
+
+let resolutionSyncRunning = false
+let lastResolutionSyncAt = 0
+
+async function fetchProtocolResolution(pred: Prediction): Promise<ProtocolResolution | null> {
+  const yesToken = pred.yesTokenId || pred.tokenId || ''
+  const noToken = pred.noTokenId || ''
+  const tokens = [...new Set([yesToken, noToken].filter(Boolean))]
+  if (tokens.length === 0) return null
+
+  const raw = await synth('/markets/prices', { method: 'POST', body: JSON.stringify(tokens) }) as Record<string, unknown>
+  const prices = (raw.prices && typeof raw.prices === 'object' ? raw.prices : raw) as Record<string, unknown>
+  const readPrice = (token: string): number | null => {
+    if (!token) return null
+    const n = Number(prices[token])
+    return Number.isFinite(n) ? n : null
+  }
+
+  const yesFinal = readPrice(yesToken)
+  let noFinal = readPrice(noToken)
+  if (noFinal == null && yesFinal != null) noFinal = +(1 - yesFinal).toFixed(6)
+  if (yesFinal == null || noFinal == null) {
+    return { resolved: false, winningSide: null, yesFinal: yesFinal ?? null, noFinal: noFinal ?? null, source: 'protocol_prices_incomplete' }
+  }
+
+  const ended = !!pred.endsAt && new Date(pred.endsAt).getTime() <= Date.now()
+  const fullySettled = (yesFinal >= 0.999 && noFinal <= 0.001) || (noFinal >= 0.999 && yesFinal <= 0.001)
+  if (!ended || !fullySettled) {
+    return { resolved: false, winningSide: null, yesFinal, noFinal, source: 'protocol_prices_live' }
+  }
+
+  return {
+    resolved: true,
+    winningSide: yesFinal > noFinal ? 'YES' : 'NO',
+    yesFinal,
+    noFinal,
+    source: 'protocol_prices_settled',
+  }
+}
+
+async function syncPredictionResolutions(limit = 250): Promise<{ checked: number; resolved: number }> {
+  if (resolutionSyncRunning) return { checked: 0, resolved: 0 }
+  resolutionSyncRunning = true
+  try {
+    const rows = predictionStore.listAll(limit)
+    const cache = new Map<string, ProtocolResolution | null>()
+    let checked = 0
+    let resolved = 0
+
+    for (const row of rows) {
+      const pred = dbToPrediction(row)
+      if (pred.status === 'resolved' || pred.wasCorrect !== null) continue
+      if (!pred.endsAt || new Date(pred.endsAt).getTime() > Date.now()) continue
+
+      checked++
+      const key = `${pred.yesTokenId || pred.tokenId || ''}::${pred.noTokenId || ''}`
+      if (!cache.has(key)) {
+        try {
+          cache.set(key, await fetchProtocolResolution(pred))
+        } catch {
+          cache.set(key, null)
+        }
+      }
+      const outcome = cache.get(key)
+      if (!outcome?.resolved || !outcome.winningSide || !pred.lean) continue
+
+      pred.wasCorrect = pred.lean === outcome.winningSide
+      pred.resolvedOutcome = outcome.winningSide
+      pred.resolutionSource = outcome.source
+      pred.resolvedAt = new Date().toISOString()
+      pred.status = 'resolved'
+      if (pred.pnl == null) pred.pnl = computeResolvedPnl(pred, outcome.winningSide)
+      pred.reflection = pred.reflection || buildReflection(pred, outcome.winningSide, outcome.yesFinal, outcome.noFinal)
+      pred.updatedAt = new Date().toISOString()
+      if (pred.orderStatus && /PENDING|OPEN|ACTIVE/i.test(pred.orderStatus)) pred.orderStatus = 'RESOLVED'
+
+      db.prepare('UPDATE predictions SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(pred), pred.id)
+      resolved++
+    }
+
+    lastResolutionSyncAt = Date.now()
+    if (resolved > 0) audit('auto_resolve_predictions', 'predict', { checked, resolved })
+    return { checked, resolved }
+  } finally {
+    resolutionSyncRunning = false
+  }
+}
+
+async function maybeSyncPredictionResolutions(): Promise<void> {
+  const stale = Date.now() - lastResolutionSyncAt > 45_000
+  if (!stale) return
+  try { await syncPredictionResolutions(250) } catch {/**/}
+}
+
 // ── NemoClaw Agent Tools ──────────────────────────────────────────
 const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'think', description: 'Record an internal reasoning step. Use this to structure your multi-stage analysis before acting. Shows the user your thinking process.', parameters: { type: 'object', properties: { stage: { type: 'string', enum: ['observe', 'orient', 'research', 'analyze', 'decide', 'act'], description: 'OODA stage' }, thought: { type: 'string', description: 'Your reasoning at this stage' } }, required: ['stage', 'thought'] } } },
@@ -344,12 +554,19 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'research_topic', description: 'Fetch news and context about a specific prediction market topic. Use for fundamental research before generating a prediction.', parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Topic to research (e.g. "Nicolai Hojgaard golf", "Bitcoin price 2026")' }, limit: { type: 'number', description: 'Number of articles (default 8)' } }, required: ['topic'] } } },
   { type: 'function', function: { name: 'generate_prediction', description: 'Run the full AI prediction engine on a market. Returns thesis, confidence, lean (YES/NO), sizing, token_id, and market data.', parameters: { type: 'object', properties: { market_name: { type: 'string' } }, required: ['market_name'] } } },
   { type: 'function', function: { name: 'place_order', description: 'Place an actual market order. Requires prediction_id and token_id from generate_prediction output. In LIVE mode with REQUIRE_APPROVAL, queues to approvals.', parameters: { type: 'object', properties: { prediction_id: { type: 'string' }, token_id: { type: 'string' }, side: { type: 'string', enum: ['BUY', 'SELL'] }, amount: { type: 'string', description: 'USDC amount' }, order_type: { type: 'string', enum: ['MARKET', 'LIMIT'] }, price: { type: 'string', description: 'Limit price 0-1 (only for LIMIT)' } }, required: ['prediction_id', 'token_id', 'side', 'amount'] } } },
+  { type: 'function', function: { name: 'list_predictions', description: 'List predictions plus learning stats (accuracy, P&L, reflections) so NemoClaw can learn from resolved outcomes.', parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['both', 'sim', 'real'], description: 'Filter by mode' }, limit: { type: 'number' } } } } },
+  { type: 'function', function: { name: 'delete_prediction', description: 'Delete a prediction by ID. Use to clean up stale or unwanted predictions.', parameters: { type: 'object', properties: { prediction_id: { type: 'string' } }, required: ['prediction_id'] } } },
+  { type: 'function', function: { name: 'clean_stale_predictions', description: 'Remove predictions for markets that have ended or resolve more than N days out and are not committed. Returns count of cleaned predictions.', parameters: { type: 'object', properties: { max_days_out: { type: 'number', description: 'Max days until resolution to keep (default 30)' } } } } },
   { type: 'function', function: { name: 'switch_tab', description: 'Navigate the dashboard to a specific tab.', parameters: { type: 'object', properties: { tab: { type: 'string', enum: ['dashboard', 'markets', 'predictions', 'approvals', 'audit', 'settings'] } }, required: ['tab'] } } },
   { type: 'function', function: { name: 'highlight', description: 'Highlight a UI element with a gold glow.', parameters: { type: 'object', properties: { element: { type: 'string' }, message: { type: 'string' } }, required: ['element'] } } },
   { type: 'function', function: { name: 'fetch_recommendations', description: 'Get personalized market recommendations from synthesis.trade.', parameters: { type: 'object', properties: {} } } },
 ]
 
 const AGENT_SYSTEM = `You are NemoClaw, the expert prediction agent inside Synth. Sharp, data-driven, and decisive. You always have a position.
+
+## CURRENT MODE: ${SIM_MODE ? 'SIMULATION (practice money, no real risk)' : 'LIVE (real money, real risk)'}
+## Default wallet: ${defaultWalletId || 'none'}
+## Prices: YES/NO prices are share costs (0.01-0.99). A YES share at $0.76 means 76% implied probability. If it resolves YES, you get $1/share → profit $0.24/share.
 
 ## Multi-Stage Research Protocol
 
@@ -381,17 +598,30 @@ Present the finding:
 - **Source:** [link or news headline]
 Then: "Place this order? YES/NO, or name a different amount."
 
-## When User Confirms
-- Call place_order with prediction_id, token_id, side, amount
+## When User Confirms (or says "commit", "place", "yes", "do it", etc.)
+- Call place_order with prediction_id, token_id, side, and the EXACT amount discussed
+- amount MUST be > 0. Use the suggested amount from generate_prediction. If user said "$5", use "5".
 - If queued to approvals (LIVE mode): tell user to check Approvals tab
 - If filled (SIM mode): confirm orderId and trigger celebration
+
+## Lifecycle Management
+- Use list_predictions to see what's already been predicted
+- Use list_predictions learning stats (accuracy + reflections) to improve future picks
+- Use clean_stale_predictions to remove distant uncommitted predictions
+- Use delete_prediction to remove specific unwanted predictions
+- Proactively suggest cleanup if there are > 10 predictions
 
 ## Critical Rules
 - Use think() before every major step — the user can see your reasoning in real time
 - ALWAYS reference specific prices, volumes, timestamps from the data you fetched
 - ALWAYS include a source link or news headline in your final answer
 - Your token_id comes from generate_prediction output — always use it
-- If user balance < $1: say so clearly, recommend depositing to the Settings > Deposit tab
+- amount in place_order MUST be a non-zero string like "5" or "10.50" — NEVER "0"
+- NEVER suggest a bet the user cannot afford. Check active_balance FIRST.
+- If user balance < $1: say so clearly. In SIM mode → recommend minting practice funds. In LIVE mode → recommend depositing via Settings > Deposit.
+- ALWAYS state the current mode (SIM/LIVE) when presenting a recommendation.
+- Prices: Express share prices as probabilities. "$0.76/share" → "76% chance". Don't just say "YES at $0.76" — say "YES (76% implied, 76¢/share)".
+- For crypto markets (BTC, ETH, SOL 15-min targets), these are great quick bets — suggest them
 - Vary your language, phrasing, and the order you present information
 - Keep final ACT message under 150 words but include all numbers
 - CRITICAL: Always end on a text message, never a tool call`
@@ -483,7 +713,17 @@ async function executeTool(
       const wid = defaultWalletId
       if (!wid) return { error: 'No wallet detected' }
       commands.push({ type: 'tool', payload: { name: 'fetch_balance' } })
-      return parseBalance(await synth(`/wallet/${wid}/balance`))
+      const realBal = parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => []))
+      const simBalData = simWallet.get(wid)
+      return {
+        mode: SIM_MODE ? 'simulation' : 'live',
+        active_balance: SIM_MODE ? simBalData : realBal,
+        sim: simBalData,
+        live: realBal,
+        note: SIM_MODE
+          ? `You are in SIMULATION mode. Practice balance: $${simBalData.total}. Live balance: $${realBal.total} (not used in sim).`
+          : `You are in LIVE mode. Real balance: $${realBal.total}. Orders use real money.`,
+      }
     }
     case 'fetch_positions': {
       const wid = defaultWalletId
@@ -516,6 +756,57 @@ async function executeTool(
       )
       commands.push({ type: 'tool', payload: { name: 'place_order', order: result } })
       return result
+    }
+    case 'list_predictions': {
+      const mode = String(args.mode || 'both')
+      const limit = Number(args.limit || 20)
+      const rows = mode === 'both' ? predictionStore.listAll(limit) : predictionStore.listByMode(mode, limit)
+      const parsed = rows.map(r => ({ row: r, p: JSON.parse(r.snapshot_json) as Prediction }))
+      const resolved = parsed.filter(x => x.p.wasCorrect !== null || x.p.status === 'resolved')
+      const correct = resolved.filter(x => x.p.wasCorrect).length
+      commands.push({ type: 'tool', payload: { name: 'list_predictions' } })
+      return {
+        learning: {
+          resolved: resolved.length,
+          correct,
+          accuracy: resolved.length > 0 ? +(correct / resolved.length * 100).toFixed(1) : 0,
+        },
+        predictions: parsed.map(({ row: r, p }) => {
+          return {
+            id: p.id, market: p.marketName, lean: p.lean, confidence: p.confidence,
+            action: p.action, amount: p.amountUsdc, status: p.status,
+            orderId: p.orderId, endsAt: p.endsAt, mode: r.mode,
+            wasCorrect: p.wasCorrect, resolvedOutcome: p.resolvedOutcome, pnl: p.pnl,
+            reflection: p.reflection,
+          }
+        }),
+      }
+    }
+    case 'delete_prediction': {
+      const pid = String(args.prediction_id || '')
+      if (!pid) return { error: 'prediction_id required' }
+      db.prepare('DELETE FROM predictions WHERE id = ?').run(pid)
+      audit('agent_delete_prediction', 'predict', { id: pid })
+      commands.push({ type: 'tool', payload: { name: 'delete_prediction', id: pid } })
+      return { deleted: true, id: pid }
+    }
+    case 'clean_stale_predictions': {
+      const maxDays = Number(args.max_days_out || 30)
+      await maybeSyncPredictionResolutions()
+      const cutoff = new Date(Date.now() + maxDays * 864e5).toISOString()
+      const all = predictionStore.listAll(500)
+      let cleaned = 0
+      for (const row of all) {
+        const p = JSON.parse(row.snapshot_json)
+        if (p.status === 'committed' || p.orderId) continue
+        if (p.endsAt && new Date(p.endsAt).getTime() > new Date(cutoff).getTime()) {
+          db.prepare('DELETE FROM predictions WHERE id = ?').run(p.id)
+          cleaned++
+        }
+      }
+      audit('agent_clean_stale', 'predict', { maxDays, cleaned })
+      commands.push({ type: 'tool', payload: { name: 'clean_stale_predictions', cleaned } })
+      return { cleaned, maxDays }
     }
     case 'switch_tab':
       commands.push({ type: 'switch_tab', payload: args.tab })
@@ -567,7 +858,7 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
       out.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
     }
 
-    for (let round = 0; round < 4; round++) {
+    for (let round = 0; round < 8; round++) {
       const followUp = await openai.chat.completions.create({
         model: activeModel, temperature: 0.3, max_tokens: 2000,
         tools: AGENT_TOOLS,
@@ -594,11 +885,12 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
 }
 
 // ── Order Placement ───────────────────────────────────────────────
-async function placeOrderViaApi(predictionId: string, tokenId: string, side: string, amount: string, orderType: string, price?: string) {
+async function placeOrderViaApi(predictionId: string, tokenId: string, side: string, amount: string, orderType: string, price?: string, modeOverride?: 'real' | 'sim') {
   const wid = defaultWalletId
   if (!wid) throw new Error('No wallet available')
+  const effectiveMode = modeOverride || (SIM_MODE ? 'sim' : 'real')
 
-  if (SIM_MODE) {
+  if (effectiveMode === 'sim') {
     const amountNum = parseFloat(amount) || 0
     simWallet.debit(wid, amountNum)
     const simOrderId = `sim_${crypto.randomUUID().slice(0, 8)}`
@@ -616,10 +908,44 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
     return { orderId: simOrderId, tokenId, side, type: orderType, amount, shares: '0', price: price || '0', status: 'SIMULATED', predictionId }
   }
 
-  const body: Record<string, string> = { token_id: tokenId, side, type: orderType, amount, units: 'USDC' }
-  if (price && orderType === 'LIMIT') body.price = price
+  const submitOrder = async (amt: string) => {
+    const body: Record<string, string> = { token_id: tokenId, side, type: orderType, amount: amt, units: 'USDC' }
+    if (price && orderType === 'LIMIT') body.price = price
+    return synth(`/wallet/pol/${wid}/order`, { method: 'POST', body: JSON.stringify(body) }) as Promise<Record<string, unknown>>
+  }
 
-  const orderResp = await synth(`/wallet/pol/${wid}/order`, { method: 'POST', body: JSON.stringify(body) }) as Record<string, unknown>
+  const requestedAmount = parseFloat(amount) || 0
+  let usedAmount = amount
+  let orderResp: Record<string, unknown> | null = null
+
+  try {
+    orderResp = await submitOrder(amount)
+  } catch (err) {
+    const msg = parseSynthErrorMessage(err)
+    if (!isPartialFillError(msg) || requestedAmount <= 0.1) throw err
+
+    // Liquidity fallback: auto-size down instead of failing the user.
+    const candidates = [0.75, 0.5, 0.33, 0.25, 0.2, 0.1]
+      .map(f => clampUsdAmount(requestedAmount * f))
+      .filter((v, i, arr) => parseFloat(v) >= 0.1 && parseFloat(v) < requestedAmount && arr.indexOf(v) === i)
+
+    let lastErrorMsg = msg
+    for (const candidate of candidates) {
+      try {
+        orderResp = await submitOrder(candidate)
+        usedAmount = candidate
+        break
+      } catch (e) {
+        const candidateMsg = parseSynthErrorMessage(e)
+        lastErrorMsg = candidateMsg
+        if (!isPartialFillError(candidateMsg)) throw e
+      }
+    }
+
+    if (!orderResp) {
+      throw new Error(`Order book liquidity is too thin right now. Tried auto-sizing down from $${requestedAmount.toFixed(2)} but could not fully fill. Last protocol message: ${lastErrorMsg}`)
+    }
+  }
 
   const orderId = String(orderResp.order_id || orderResp.stoploss_id || '')
   const row = predictionStore.getById(predictionId)
@@ -634,11 +960,13 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
   audit('place_order', 'order', { predictionId, tokenId, side, amount, orderType, mode: 'real', orderId })
   return {
     orderId, tokenId, side, type: orderType,
-    amount: String(orderResp.amount || amount),
+    amount: String(orderResp.amount || usedAmount || amount),
     shares: String(orderResp.shares || '0'),
     price: String(orderResp.price || price || '0'),
     status: String(orderResp.status || 'PENDING'),
     predictionId,
+    requestedAmount: amount,
+    autoSized: usedAmount !== amount,
   }
 }
 
@@ -730,8 +1058,23 @@ app.get('/api/wallet/:id/balance', async (req, res) => {
 
 // Positions -- correct API: GET /wallet/{wallet_id}/positions
 app.get('/api/wallet/:id/positions', async (req, res) => {
-  try { res.json(await synth(`/wallet/${req.params.id}/positions`)) }
-  catch (e) { res.status(502).json({ error: String(e) }) }
+  try {
+    const [generic, polymarket] = await Promise.all([
+      synth(`/wallet/${req.params.id}/positions`).catch(() => []),
+      synth(`/wallet/pol/${req.params.id}/positions`).catch(() => []),
+    ])
+    const genArr = Array.isArray(generic) ? generic : []
+    const polArr = Array.isArray(polymarket) ? polymarket : []
+    const seen = new Set<string>()
+    const merged: unknown[] = []
+    for (const p of [...polArr, ...genArr]) {
+      const obj = p as Record<string, unknown>
+      const pos = obj.position as Record<string, unknown> | undefined
+      const key = String(pos?.token_id || obj.token_id || obj.condition_id || JSON.stringify(p))
+      if (!seen.has(key)) { seen.add(key); merged.push(p) }
+    }
+    res.json(merged)
+  } catch (e) { res.status(502).json({ error: String(e) }) }
 })
 
 // PnL -- correct API: GET /wallet/{wallet_id}/pnl
@@ -783,13 +1126,14 @@ app.post('/api/wallet/:id/order/quote', async (req, res) => {
   } catch (e) { res.status(502).json({ error: String(e) }) }
 })
 
-// Place order
+// Place order — mode-aware per-request
 app.post('/api/wallet/:id/order', async (req, res) => {
   try {
-    const { predictionId, tokenId, side, amount, type: orderType, price, venue, units } = req.body
+    const { predictionId, tokenId, side, amount, type: orderType, price, venue, units, mode: reqMode } = req.body
     if (!tokenId || !side || !amount) return res.status(400).json({ error: 'tokenId, side, amount required' })
+    const effectiveMode: 'real' | 'sim' = reqMode === 'real' ? 'real' : reqMode === 'sim' ? 'sim' : (SIM_MODE ? 'sim' : 'real')
 
-    if (REQUIRE_APPROVAL && !SIM_MODE) {
+    if (REQUIRE_APPROVAL && effectiveMode === 'real') {
       const approvalId = crypto.randomUUID().slice(0, 12)
       approvalStore.insert({
         id: approvalId, type: 'place_order',
@@ -797,13 +1141,13 @@ app.post('/api/wallet/:id/order', async (req, res) => {
         prediction_id: predictionId || null, mode: 'real', status: 'pending',
         created_at: new Date().toISOString(), resolved_at: null, order_result_json: null,
       })
-      audit('order_approval_queued', 'order', { approvalId, predictionId })
-      return res.json({ queued: true, approvalId, message: 'Order queued for approval. Go to Approvals tab to confirm.' })
+      audit('order_approval_queued', 'order', { approvalId, predictionId, mode: 'real' })
+      return res.json({ queued: true, approvalId, message: 'Live order queued for approval. Go to Approvals tab to confirm.' })
     }
 
-    const result = await placeOrderViaApi(predictionId || '', tokenId, side, amount, orderType || 'MARKET', price)
+    const result = await placeOrderViaApi(predictionId || '', tokenId, side, amount, orderType || 'MARKET', price, effectiveMode)
     res.json(result)
-  } catch (e) { res.status(500).json({ error: String(e) }) }
+  } catch (e) { res.status(500).json({ error: parseSynthErrorMessage(e) }) }
 })
 
 // Markets -- multi-source aggregation with time horizon + deduplication
@@ -819,17 +1163,19 @@ app.get('/api/markets', async (req, res) => {
     }
 
     const n = Math.min(parseInt(String(limit) || '40') || 40, 80)
-    const [trending, kalshi, recs, polymarkets] = await Promise.all([
-      synth(`/markets?limit=${Math.ceil(n * 0.4)}${venue ? `&venue=${venue}` : ''}`).catch(() => []),
-      venue === 'polymarket' ? Promise.resolve([]) : synth(`/kalshi/markets?limit=${Math.ceil(n * 0.25)}`).catch(() => []),
-      synth(`/recommendations?limit=${Math.ceil(n * 0.2)}`).catch(() => []),
-      venue === 'kalshi' ? Promise.resolve([]) : synth(`/polymarket/markets?limit=${Math.ceil(n * 0.15)}`).catch(() => []),
+    const [trending, kalshi, recs, polymarkets, crypto] = await Promise.all([
+      synth(`/markets?limit=${Math.ceil(n * 0.3)}${venue ? `&venue=${venue}` : ''}`).catch(() => []),
+      venue === 'polymarket' ? Promise.resolve([]) : synth(`/kalshi/markets?limit=${Math.ceil(n * 0.2)}`).catch(() => []),
+      synth(`/recommendations?limit=${Math.ceil(n * 0.15)}`).catch(() => []),
+      venue === 'kalshi' ? Promise.resolve([]) : synth(`/polymarket/markets?limit=${Math.ceil(n * 0.1)}`).catch(() => []),
+      synth(`/markets/search/crypto?limit=${Math.ceil(n * 0.25)}`).catch(() => []),
     ])
     const all = [
       ...(Array.isArray(trending) ? trending : []),
       ...(Array.isArray(kalshi) ? kalshi : []),
       ...(Array.isArray(recs) ? recs : []),
       ...(Array.isArray(polymarkets) ? polymarkets : []),
+      ...(Array.isArray(crypto) ? crypto : []),
     ]
 
     const seen = new Map<string, unknown>()
@@ -867,17 +1213,19 @@ app.post('/api/predict', async (req, res) => {
 // Legacy generate endpoint (convenience alias)
 app.post('/api/predictions/generate', async (req, res) => {
   try {
-    const { query, walletId } = req.body
+    const { query, walletId, mode: reqMode } = req.body
     if (!query) return res.status(400).json({ error: 'query required' })
+    const effectiveMode: 'real' | 'sim' = reqMode === 'real' ? 'real' : reqMode === 'sim' ? 'sim' : (SIM_MODE ? 'sim' : 'real')
     const events = await synth(`/markets/search/${encodeURIComponent(query)}?limit=10`) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
     const flat = events.flatMap(ev => ev.markets.map(m => ({ ...m, event_title: ev.event.title, venue: ev.venue, ends_at: m.ends_at || ev.event.ends_at })))
-    res.json(await generatePrediction(query, flat, walletId || defaultWalletId))
+    res.json(await generatePrediction(query, flat, walletId || defaultWalletId, undefined, effectiveMode))
   } catch (e) { res.status(500).json({ error: String(e) }) }
 })
 
 // Predictions list -- mode-aware + date labels + no dead traces
-app.get('/api/predictions', (_req, res) => {
+app.get('/api/predictions', async (_req, res) => {
   try {
+    await maybeSyncPredictionResolutions()
     const limit = Math.max(1, parseInt(String(_req.query.limit || '100')) || 100)
     const mode = String(_req.query.mode || 'both')
     const rows = mode === 'both' ? predictionStore.listAll(limit) : predictionStore.listByMode(mode, limit)
@@ -903,6 +1251,40 @@ app.post('/api/predictions/:id/resolve', (req, res) => {
   db.prepare('UPDATE predictions SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(pred), req.params.id)
   audit('resolve_prediction', 'predict', { id: req.params.id, wasCorrect })
   res.json(pred)
+})
+
+// Force-sync protocol outcomes for ended markets
+app.post('/api/predictions/sync', async (_req, res) => {
+  try {
+    const result = await syncPredictionResolutions(300)
+    res.json({ ok: true, ...result })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) })
+  }
+})
+
+// Clean stale predictions (ended markets + very distant uncommitted)
+app.post('/api/predictions/clean', async (req, res) => {
+  try {
+    await maybeSyncPredictionResolutions()
+    const maxDays = parseInt(String(req.body.maxDays || '30'))
+    const cutoff = new Date(Date.now() + maxDays * 864e5).toISOString()
+    const all = predictionStore.listAll(500)
+    let cleaned = 0
+    const removed: string[] = []
+    for (const row of all) {
+      const p = JSON.parse(row.snapshot_json)
+      if (p.status === 'committed' || p.orderId) continue
+      const tooFar = p.endsAt && new Date(p.endsAt).getTime() > new Date(cutoff).getTime()
+      if (tooFar) {
+        db.prepare('DELETE FROM predictions WHERE id = ?').run(p.id)
+        removed.push(p.id)
+        cleaned++
+      }
+    }
+    audit('clean_stale', 'predict', { maxDays, cleaned })
+    res.json({ cleaned, removed })
+  } catch (e) { res.status(500).json({ error: String(e) }) }
 })
 
 // Delete prediction
@@ -940,14 +1322,15 @@ app.post('/api/approvals/:id/approve', async (req, res) => {
   if (a.type === 'place_order') {
     try {
       const p = JSON.parse(a.params_json) as { tokenId: string; side: string; amount: string; orderType: string; price?: string; predictionId?: string }
-      const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, p.amount, p.orderType, p.price)
+      const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, p.amount, p.orderType, p.price, a.mode as 'real' | 'sim')
       approvalStore.updateStatus(a.id, 'executed', JSON.stringify(result))
-      audit('order_executed', 'order', { approvalId: a.id, orderId: result.orderId })
+      audit('order_executed', 'order', { approvalId: a.id, orderId: result.orderId, mode: a.mode })
       return res.json({ id: a.id, status: 'executed', orderResult: result })
     } catch (e) {
       approvalStore.updateStatus(a.id, 'failed')
-      audit('order_failed', 'order', { approvalId: a.id, error: String(e) })
-      return res.status(500).json({ error: String(e) })
+      const message = parseSynthErrorMessage(e)
+      audit('order_failed', 'order', { approvalId: a.id, error: message })
+      return res.status(500).json({ error: message })
     }
   }
 
@@ -1098,6 +1481,8 @@ refreshWallets().then(() => {
   const predCount = predictionStore.listAll(1).length
   startAggregationWorker(openai, activeModel)
   startCompactionWorker()
+  setTimeout(() => { void syncPredictionResolutions(300) }, 5000)
+  setInterval(() => { void syncPredictionResolutions(300) }, 60_000)
   app.listen(PORT, HOST, () => {
     console.log(`\n  ⚡ Synth server running at http://127.0.0.1:${PORT}`)
     console.log(`  📊 ${SIM_MODE ? 'SIMULATION' : 'LIVE'} mode | AI: ${openai ? '✓' : '✗'} | DB predictions: ${predCount}`)

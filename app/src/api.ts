@@ -17,12 +17,16 @@ export const getMarkets     = (q = '', v = '', n = 40, days?: number) => api<unk
 export const getPredictions = (n = 50, mode = 'both') => api<Prediction[]>(`/predictions?limit=${n}&mode=${mode}`)
 export const predict        = (query: string, walletId?: string, mode = 'both') =>
   api<DualPrediction>('/predict', { method: 'POST', body: JSON.stringify({ query, walletId, mode }) })
-export const generatePrediction = (query: string, walletId?: string) =>
-  api<Prediction>('/predictions/generate', { method: 'POST', body: JSON.stringify({ query, walletId }) })
+export const generatePrediction = (query: string, walletId?: string, mode?: string) =>
+  api<Prediction>('/predictions/generate', { method: 'POST', body: JSON.stringify({ query, walletId, mode }) })
 export const resolvePrediction = (id: string, wasCorrect: boolean, pnl?: number) =>
   api<Prediction>(`/predictions/${id}/resolve`, { method: 'POST', body: JSON.stringify({ wasCorrect, pnl }) })
 export const deletePrediction = (id: string) =>
   api<{ deleted: boolean }>(`/predictions/${id}`, { method: 'DELETE' })
+export const cleanStalePredictions = (maxDays = 30) =>
+  api<{ cleaned: number; removed: string[] }>('/predictions/clean', { method: 'POST', body: JSON.stringify({ maxDays }) })
+export const syncPredictionResolutions = () =>
+  api<{ ok: boolean; checked: number; resolved: number }>('/predictions/sync', { method: 'POST' })
 export const getNotes       = (tag?: string, period?: string, n = 50) => {
   const p = new URLSearchParams({ limit: String(n) })
   if (tag) p.set('tag', tag)

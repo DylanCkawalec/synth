@@ -5,11 +5,14 @@ FROM node:22-alpine AS builder
 
 WORKDIR /build
 
+# Install build dependencies for native modules (better-sqlite3)
+RUN apk add --no-cache python3 make g++
+
 # Copy and install all dependencies (including devDependencies for build)
 COPY app/package*.json ./
-RUN npm ci
+RUN npm ci && npm rebuild better-sqlite3 --build-from-source
 
-# Copy source and build
+# Copy source (excluding node_modules via .dockerignore)
 COPY app/ .
 RUN npm run build
 
@@ -19,17 +22,18 @@ FROM node:22-alpine AS runtime
 
 WORKDIR /app
 
-# Install curl for healthcheck
+# Install curl for healthcheck and any runtime native deps
 RUN apk add --no-cache curl ca-certificates
 
 # Copy built frontend
 COPY --from=builder /build/dist ./app/dist
 
-# Copy server source files
+# Copy server source files (excluding node_modules)
 COPY app/server ./app/server
 COPY app/package*.json ./app/
 
 # Copy node_modules from builder (includes tsx and all deps)
+# The better-sqlite3 binary in this directory is now built for Linux Alpine
 COPY --from=builder /build/node_modules ./app/node_modules
 
 # Create data directory
