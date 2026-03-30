@@ -270,6 +270,7 @@ export default function App() {
     if (!commitModal) return
     const amt = parseFloat(commitAmt) || 0
     if (amt <= 0) { flash('Enter a valid amount'); return }
+    if (wMode === 'real' && amt < 1) { flash('Live orders require at least $1.00'); return }
     await placeOrder(commitModal, amt, commitDir)
     setCommitModal(null)
   }
@@ -377,7 +378,8 @@ export default function App() {
     if (!wid || !chosenTokenId) { flash('Missing wallet or token ID'); return }
     setOrderLoading(p.id)
     try {
-      const amount = String(amountOverride ?? p.amountUsdc)
+      const rawAmt = amountOverride ?? p.amountUsdc
+      const amount = String(wMode === 'real' ? Math.max(rawAmt, 1) : rawAmt)
       const result = await api.placeOrder(wid, {
         predictionId: p.id,
         tokenId: chosenTokenId,
@@ -705,7 +707,8 @@ export default function App() {
         const modeTotal = parseFloat(modeBal?.total || '0')
         const leanPrice = commitDir === 'YES' ? p.yesPrice : p.noPrice
         const amt = parseFloat(commitAmt) || 0
-        const minE = Math.max(0.10, leanPrice > 0 ? leanPrice : (p.minEntryUsdc || 0.50))
+        const exchangeMin = isSim ? 0.10 : 1.00
+        const minE = Math.max(exchangeMin, leanPrice > 0 ? leanPrice : (p.minEntryUsdc || exchangeMin))
         const maxA = Math.min(p.maxAffordableUsdc || 100, modeTotal * 0.10)
         const canAffordAnything = modeTotal >= minE
         const estShares = leanPrice > 0 ? (amt / leanPrice) : 0
@@ -1323,11 +1326,11 @@ export default function App() {
                       <div className="mx-4 mb-3 flex gap-4 text-[10px]">
                         <div className="flex items-center gap-1">
                           <span className="text-s-muted">Min entry:</span>
-                          <span className="font-mono font-semibold">${f(p.minEntryUsdc || 0.10)}</span>
+                          <span className="font-mono font-semibold">${f(Math.max(wMode === 'real' ? 1 : 0.10, p.minEntryUsdc || 0.10))}</span>
                         </div>
                         <div className="flex items-center gap-1">
                           <span className="text-s-muted">You can bet up to:</span>
-                          <span className={`font-mono font-semibold ${(p.maxAffordableUsdc || 0) >= (p.minEntryUsdc || 0.10) ? 'text-s-green' : 'text-s-danger'}`}>${f(p.maxAffordableUsdc || 0)}</span>
+                          <span className={`font-mono font-semibold ${(p.maxAffordableUsdc || 0) >= Math.max(wMode === 'real' ? 1 : 0.10, p.minEntryUsdc || 0.10) ? 'text-s-green' : 'text-s-danger'}`}>${f(p.maxAffordableUsdc || 0)}</span>
                         </div>
                         <div className="flex items-center gap-1">
                           <span className="text-s-muted">Yes:</span>

@@ -99,8 +99,14 @@ function isPartialFillError(msg: string): boolean {
   return /fully filled|partial fill|insufficient liquidity|could not be fully filled/i.test(msg)
 }
 
+function isMinimumSizeError(msg: string): boolean {
+  return /minimum size|min_size|INVALID_ORDER_MIN_SIZE|lower than the minimum|does not meet minimum/i.test(msg)
+}
+
+const EXCHANGE_MIN_USDC = 1.00
+
 function clampUsdAmount(v: number): string {
-  return Math.max(0.1, Number(v.toFixed(2))).toFixed(2)
+  return Math.max(EXCHANGE_MIN_USDC, Number(v.toFixed(2))).toFixed(2)
 }
 
 function buildReflection(pred: Prediction, resolvedOutcome: 'YES' | 'NO', yesFinal: number | null, noFinal: number | null): string {
@@ -240,7 +246,7 @@ function buildPrediction(data: Record<string, unknown>, exec: Record<string, unk
   const maxAffordable = balanceUsdc * RISK.maxPerPredictionPct
 
   const rawAmount = Number(exec.amount_usdc) || 0
-  const safeMinBet = Math.max(minEntry, 0.50)
+  const safeMinBet = Math.max(minEntry, EXCHANGE_MIN_USDC)
   const effectiveAmount = rawAmount >= safeMinBet ? rawAmount : Math.min(safeMinBet, maxAffordable > 0 ? maxAffordable : safeMinBet)
 
   return {
@@ -915,35 +921,73 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
   }
 
   const requestedAmount = parseFloat(amount) || 0
-  let usedAmount = amount
+  const clampedAmount = clampUsdAmount(requestedAmount)
+  let usedAmount = clampedAmount
   let orderResp: Record<string, unknown> | null = null
 
   try {
-    orderResp = await submitOrder(amount)
+    orderResp = await submitOrder(clampedAmount)
   } catch (err) {
     const msg = parseSynthErrorMessage(err)
-    if (!isPartialFillError(msg) || requestedAmount <= 0.1) throw err
 
-    // Liquidity fallback: auto-size down instead of failing the user.
-    const candidates = [0.75, 0.5, 0.33, 0.25, 0.2, 0.1]
-      .map(f => clampUsdAmount(requestedAmount * f))
-      .filter((v, i, arr) => parseFloat(v) >= 0.1 && parseFloat(v) < requestedAmount && arr.indexOf(v) === i)
+    if (isMinimumSizeError(msg)) {
+      const balResp = await synth(`/wallet/${wid}/balance`).catch(() => [])
+      const bal = parseBalance(balResp)
+      const available = parseFloat(bal.total) || 0
 
-    let lastErrorMsg = msg
-    for (const candidate of candidates) {
-      try {
-        orderResp = await submitOrder(candidate)
-        usedAmount = candidate
-        break
-      } catch (e) {
-        const candidateMsg = parseSynthErrorMessage(e)
-        lastErrorMsg = candidateMsg
-        if (!isPartialFillError(candidateMsg)) throw e
+      const scaledCandidates = [2, 3, 5, 10]
+        .map(v => clampUsdAmount(v))
+        .filter((v, i, arr) => {
+          const n = parseFloat(v)
+          return n > parseFloat(clampedAmount) && n <= available && arr.indexOf(v) === i
+        })
+
+      let lastMinMsg = msg
+      for (const candidate of scaledCandidates) {
+        try {
+          orderResp = await submitOrder(candidate)
+          usedAmount = candidate
+          break
+        } catch (e2) {
+          const retryMsg = parseSynthErrorMessage(e2)
+          lastMinMsg = retryMsg
+          if (!isMinimumSizeError(retryMsg)) throw e2
+        }
       }
-    }
 
-    if (!orderResp) {
-      throw new Error(`Order book liquidity is too thin right now. Tried auto-sizing down from $${requestedAmount.toFixed(2)} but could not fully fill. Last protocol message: ${lastErrorMsg}`)
+      if (!orderResp) {
+        const minRequired = scaledCandidates.length > 0
+          ? `at least $${scaledCandidates[scaledCandidates.length - 1]}`
+          : 'a larger amount'
+        throw new Error(
+          available < EXCHANGE_MIN_USDC
+            ? `Insufficient balance ($${available.toFixed(2)}). Deposit at least $${EXCHANGE_MIN_USDC.toFixed(2)} to place live orders.`
+            : `Order does not meet exchange minimum size. Tried up to $${scaledCandidates[scaledCandidates.length - 1] || clampedAmount} but still rejected. You may need ${minRequired}. Protocol: ${lastMinMsg}`,
+        )
+      }
+    } else if (isPartialFillError(msg) && requestedAmount > EXCHANGE_MIN_USDC) {
+      const candidates = [0.75, 0.5, 0.33, 0.25]
+        .map(f => clampUsdAmount(requestedAmount * f))
+        .filter((v, i, arr) => parseFloat(v) >= EXCHANGE_MIN_USDC && parseFloat(v) < requestedAmount && arr.indexOf(v) === i)
+
+      let lastErrorMsg = msg
+      for (const candidate of candidates) {
+        try {
+          orderResp = await submitOrder(candidate)
+          usedAmount = candidate
+          break
+        } catch (e) {
+          const candidateMsg = parseSynthErrorMessage(e)
+          lastErrorMsg = candidateMsg
+          if (!isPartialFillError(candidateMsg)) throw e
+        }
+      }
+
+      if (!orderResp) {
+        throw new Error(`Order book liquidity is too thin right now. Tried auto-sizing down from $${requestedAmount.toFixed(2)} but could not fully fill. Last protocol message: ${lastErrorMsg}`)
+      }
+    } else {
+      throw err
     }
   }
 
@@ -957,16 +1001,16 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
     db.prepare('UPDATE predictions SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(pred), predictionId)
   }
 
-  audit('place_order', 'order', { predictionId, tokenId, side, amount, orderType, mode: 'real', orderId })
+  audit('place_order', 'order', { predictionId, tokenId, side, amount: usedAmount, orderType, mode: 'real', orderId })
   return {
     orderId, tokenId, side, type: orderType,
-    amount: String(orderResp.amount || usedAmount || amount),
+    amount: String(orderResp.amount || usedAmount || clampedAmount),
     shares: String(orderResp.shares || '0'),
     price: String(orderResp.price || price || '0'),
     status: String(orderResp.status || 'PENDING'),
     predictionId,
     requestedAmount: amount,
-    autoSized: usedAmount !== amount,
+    autoSized: usedAmount !== clampedAmount,
   }
 }
 
@@ -1145,7 +1189,8 @@ app.post('/api/wallet/:id/order', async (req, res) => {
       return res.json({ queued: true, approvalId, message: 'Live order queued for approval. Go to Approvals tab to confirm.' })
     }
 
-    const result = await placeOrderViaApi(predictionId || '', tokenId, side, amount, orderType || 'MARKET', price, effectiveMode)
+    const safeAmount = effectiveMode === 'real' ? clampUsdAmount(parseFloat(amount) || EXCHANGE_MIN_USDC) : amount
+    const result = await placeOrderViaApi(predictionId || '', tokenId, side, safeAmount, orderType || 'MARKET', price, effectiveMode)
     res.json(result)
   } catch (e) { res.status(500).json({ error: parseSynthErrorMessage(e) }) }
 })
@@ -1322,7 +1367,8 @@ app.post('/api/approvals/:id/approve', async (req, res) => {
   if (a.type === 'place_order') {
     try {
       const p = JSON.parse(a.params_json) as { tokenId: string; side: string; amount: string; orderType: string; price?: string; predictionId?: string }
-      const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, p.amount, p.orderType, p.price, a.mode as 'real' | 'sim')
+      const safeAmount = clampUsdAmount(parseFloat(p.amount) || EXCHANGE_MIN_USDC)
+      const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, safeAmount, p.orderType, p.price, a.mode as 'real' | 'sim')
       approvalStore.updateStatus(a.id, 'executed', JSON.stringify(result))
       audit('order_executed', 'order', { approvalId: a.id, orderId: result.orderId, mode: a.mode })
       return res.json({ id: a.id, status: 'executed', orderResult: result })
