@@ -1,14 +1,39 @@
 # Synth - Docker Compose Configuration
-# Production-ready setup for synth:latest
+# Production-ready setup with Opseeq AI Agent Gateway
+#
+# Opseeq is built from the sibling opseeq repo (../opseeq) so `docker compose up --build`
+# always produces the current source — not a stale local tag from hours ago.
+# Override path: OPSEEQ_REPO=/path/to/opseeq docker compose up --build -d
 
 services:
+  opseeq:
+    build:
+      context: ${OPSEEQ_REPO:-../opseeq}
+      dockerfile: Dockerfile.service
+    image: opseeq:v5
+    container_name: opseeq
+    ports:
+      - "9090:9090"
+    env_file:
+      - .env
+    environment:
+      - OPSEEQ_HOST=0.0.0.0
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
   synth:
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - synth:latest
-    image: synth:latest
+        - synth:v5
+    image: synth:v5
     container_name: synth
     ports:
       - "8420:8420"
@@ -17,9 +42,13 @@ services:
     environment:
       - SERVER_HOST=0.0.0.0
       - NODE_ENV=production
+      - OPENAI_BASE_URL=http://opseeq:9090/v1
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env:ro
+    depends_on:
+      opseeq:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8420/api/health"]

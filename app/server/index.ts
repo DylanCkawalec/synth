@@ -3,6 +3,7 @@ import cors from 'cors'
 import { config } from 'dotenv'
 import { resolve, join } from 'path'
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs'
+import { spawn as spawnProcess } from 'child_process'
 import OpenAI from 'openai'
 import { db, predictionStore, summaryStore, approvalStore } from './db.ts'
 import { simWallet } from './simWallet.ts'
@@ -37,6 +38,7 @@ const CONF_THRESH = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.55')
 const REQUIRE_APPROVAL = process.env.REQUIRE_APPROVAL !== 'false'
 
 const AVAILABLE_MODELS = ['gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini', 'o3', 'gpt-4.5-preview'] as const
+const OPSEEQ_FALLBACK_MODELS = ['nvidia/llama-3.3-nemotron-super-49b-v1', 'nvidia/nemotron-3-super-120b-a12b'] as const
 let horizonDays = parseInt(process.env.MARKET_HORIZON_DAYS || '7')
 
 const RISK = {
@@ -95,6 +97,10 @@ function parseSynthErrorMessage(err: unknown): string {
   return raw
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 function isPartialFillError(msg: string): boolean {
   return /fully filled|partial fill|insufficient liquidity|could not be fully filled/i.test(msg)
 }
@@ -140,9 +146,44 @@ function computeResolvedPnl(pred: Prediction, resolvedOutcome: 'YES' | 'NO'): nu
 
 // Approvals are now persisted in SQLite via approvalStore
 
-// ── Audit ─────────────────────────────────────────────────────────
-function audit(action: string, category: string, params: unknown, success = true) {
-  const entry = { timestamp: new Date().toISOString(), action, category, params, success, mode: SIM_MODE ? 'simulation' : 'live' }
+// ── Trace + Audit ─────────────────────────────────────────────────
+function traceId(): string { return `tr_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 6)}` }
+
+interface TraceEvent {
+  traceId: string
+  timestamp: string
+  stage: string
+  action: string
+  mode: 'live' | 'simulation'
+  route: 'opseeq' | 'direct' | 'fallback'
+  model?: string
+  predictionId?: string
+  approvalId?: string
+  orderId?: string
+  success: boolean
+  detail?: Record<string, unknown>
+  latencyMs?: number
+}
+
+const recentTraces: TraceEvent[] = []
+const MAX_TRACES = 200
+
+function emitTrace(evt: Omit<TraceEvent, 'timestamp'>): void {
+  const full: TraceEvent = { ...evt, timestamp: new Date().toISOString() }
+  recentTraces.push(full)
+  if (recentTraces.length > MAX_TRACES) recentTraces.splice(0, recentTraces.length - MAX_TRACES)
+  appendFileSync(AUDIT_FILE, JSON.stringify(full) + '\n')
+}
+
+function currentRoute(): 'opseeq' | 'direct' | 'fallback' {
+  if (opseeqAvailable && opseeqConsecutiveFailures < OPSEEQ_CIRCUIT_THRESHOLD) return 'opseeq'
+  if (openai) return opseeqConsecutiveFailures >= OPSEEQ_CIRCUIT_THRESHOLD ? 'fallback' : 'direct'
+  return 'direct'
+}
+
+function audit(action: string, category: string, params: unknown, success = true, effectiveMode?: 'real' | 'sim') {
+  const mode = effectiveMode ? (effectiveMode === 'sim' ? 'simulation' : 'live') : (SIM_MODE ? 'simulation' : 'live')
+  const entry = { timestamp: new Date().toISOString(), action, category, params, success, mode, route: currentRoute() }
   appendFileSync(AUDIT_FILE, JSON.stringify(entry) + '\n')
 }
 
@@ -190,7 +231,71 @@ function parseBalance(raw: unknown): { total: string; available: string; chains:
 }
 
 // ── OpenAI ────────────────────────────────────────────────────────
-const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null
+const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY, baseURL: 'https://api.openai.com/v1' }) : null
+let opseeqModels: string[] = [...OPSEEQ_FALLBACK_MODELS]
+let opseeqConsecutiveFailures = 0
+const OPSEEQ_CIRCUIT_THRESHOLD = 3
+
+function getOpseeqClient(): OpenAI | null {
+  const url = process.env.OPSEEQ_URL || 'http://127.0.0.1:9090'
+  try {
+    return new OpenAI({ baseURL: `${url}/v1`, apiKey: 'opseeq' })
+  } catch { return null }
+}
+
+function getInferenceClient(): OpenAI {
+  if (opseeqAvailable && opseeqConsecutiveFailures < OPSEEQ_CIRCUIT_THRESHOLD) {
+    const client = getOpseeqClient()
+    if (client) return client
+  }
+  if (openai) return openai
+  throw new Error('No inference backend available — set OPENAI_API_KEY or start Opseeq')
+}
+
+function getDirectOpenAIClient(): OpenAI | null {
+  return openai
+}
+
+// Balance cache: avoids hitting upstream 3x in the same prediction+order flow
+const balanceCache = new Map<string, { bal: ReturnType<typeof parseBalance>; at: number }>()
+const BALANCE_CACHE_TTL = 5000
+
+async function getCachedBalance(wid: string, mode: 'real' | 'sim'): Promise<ReturnType<typeof parseBalance>> {
+  if (mode === 'sim') return simWallet.get(wid) as ReturnType<typeof parseBalance>
+  const key = `${wid}:${mode}`
+  const cached = balanceCache.get(key)
+  if (cached && Date.now() - cached.at < BALANCE_CACHE_TTL) return cached.bal
+  const bal = parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => []))
+  balanceCache.set(key, { bal, at: Date.now() })
+  return bal
+}
+
+function invalidateBalanceCache(wid: string) {
+  for (const key of balanceCache.keys()) { if (key.startsWith(wid)) balanceCache.delete(key) }
+}
+
+function getAllAvailableModels(): string[] {
+  const m = [...AVAILABLE_MODELS] as string[]
+  if (opseeqAvailable) m.push(...opseeqModels)
+  return [...new Set(m)]
+}
+
+function getEffectiveModel(preferred?: string): string {
+  const requested = preferred || activeModel
+  if (opseeqAvailable) {
+    return requested.startsWith('nvidia/') ? requested : (process.env.OPSEEQ_MODEL || opseeqModels[0] || OPSEEQ_FALLBACK_MODELS[0])
+  }
+  return requested
+}
+
+function getEffectivePredictionModel(preferred?: string): string {
+  return getEffectiveModel(preferred)
+}
+
+function getEffectiveAgentModel(): string {
+  if (opseeqAvailable) return process.env.OPSEEQ_AGENT_MODEL || 'gpt-4.1-mini'
+  return activeModel
+}
 
 const PRED_SYSTEM = `You are Synth, an expert prediction-market analyst with deep knowledge of current events, politics, sports, crypto, and finance. You use real market data (prices, volume, liquidity, expiry) to form sharp opinions.
 
@@ -245,18 +350,26 @@ function buildPrediction(data: Record<string, unknown>, exec: Record<string, unk
   const minEntry = leanPrice > 0 ? Math.max(0.10, leanPrice) : 1
   const maxAffordable = balanceUsdc * RISK.maxPerPredictionPct
 
+  const confidence = Math.max(0, Math.min(1, Number(data.confidence) || 0))
+  const kellyResult = leanPrice > 0 && confidence > 0
+    ? kellyBinaryMarket(confidence, leanPrice, balanceUsdc)
+    : null
+  const kellyAmount = kellyResult?.bankrollFractionUsdc || 0
+
   const rawAmount = Number(exec.amount_usdc) || 0
   const safeMinBet = Math.max(minEntry, EXCHANGE_MIN_USDC)
-  const effectiveAmount = rawAmount >= safeMinBet ? rawAmount : Math.min(safeMinBet, maxAffordable > 0 ? maxAffordable : safeMinBet)
+  const kellyOrRaw = kellyAmount > safeMinBet ? kellyAmount : rawAmount
+  const cappedAmount = Math.min(kellyOrRaw, maxAffordable, RISK.maxSingleOrderUsdc)
+  const effectiveAmount = cappedAmount >= safeMinBet ? cappedAmount : Math.min(safeMinBet, maxAffordable > 0 ? maxAffordable : safeMinBet)
 
   return {
     id: crypto.randomUUID().slice(0, 12),
-    thesis: String(data.thesis || ''), confidence: Math.max(0, Math.min(1, Number(data.confidence) || 0)),
+    thesis: String(data.thesis || ''), confidence,
     rationale: String(data.rationale || ''), invalidation: String(data.invalidation || ''),
     riskNote: String(data.risk_note || ''), status: 'generated',
     action: String(exec.action || 'BUY'), side: String(exec.side || 'BUY'), amountUsdc: +effectiveAmount.toFixed(2),
     orderType: String(exec.order_type || 'MARKET'), price: exec.price != null ? Number(exec.price) : null,
-    kellyFraction: exec.kelly_fraction != null ? Number(exec.kelly_fraction) : null,
+    kellyFraction: kellyResult?.fractionalKelly ?? (exec.kelly_fraction != null ? Number(exec.kelly_fraction) : null),
     lean: lean === 'YES' || lean === 'NO' ? lean : null,
     leanReason: data.lean_reason ? String(data.lean_reason) : null,
     minEntryUsdc: +minEntry.toFixed(2),
@@ -275,11 +388,15 @@ function buildPrediction(data: Record<string, unknown>, exec: Record<string, unk
 }
 
 async function generatePrediction(query: string, markets: unknown[], walletId?: string, modelOverride?: string, modeOverride?: 'real' | 'sim'): Promise<Prediction> {
-  if (!openai) throw new Error('OPENAI_API_KEY not set')
-  const model = modelOverride || activeModel
+  const tId = traceId()
+  const t0 = Date.now()
+  const client = getInferenceClient()
+  const model = getEffectivePredictionModel(modelOverride || activeModel)
   const wid = walletId || defaultWalletId
   const mode: 'real' | 'sim' = modeOverride || (SIM_MODE ? 'sim' : 'real')
-  const bal = mode === 'sim' && wid ? simWallet.get(wid) : (wid ? parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => [])) : { total: '0' })
+  const route = currentRoute()
+  emitTrace({ traceId: tId, stage: 'prediction_start', action: 'generate_prediction', mode: mode === 'sim' ? 'simulation' : 'live', route, model, success: true, detail: { query, marketCount: markets.length, balance: null } })
+  const bal = wid ? await getCachedBalance(wid, mode) : { total: '0' } as ReturnType<typeof parseBalance>
   const balNum = parseFloat(bal.total) || 0
 
   const enrichedMarkets = markets.slice(0, 12).map((raw: unknown) => {
@@ -307,21 +424,63 @@ ${JSON.stringify(enrichedMarkets, null, 2)}
 
 Pick the single best market matching the query. Analyze it deeply. Always provide a YES or NO lean with reasoning.`
 
-  const useJsonMode = !model.startsWith('o1') && !model.startsWith('o3')
-  const resp = await openai.chat.completions.create({
-    model, temperature: useJsonMode ? 0.3 : undefined, max_tokens: 2000,
-    ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
-    messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
-  })
+  const isNim = model.startsWith('nvidia/')
+  const useJsonMode = !model.startsWith('o1') && !model.startsWith('o3') && !isNim
+  let predModel = model
 
-  let raw = resp.choices[0].message.content || '{}'
-  const jsonMatch = raw.match(/\{[\s\S]*\}/)
-  if (jsonMatch) raw = jsonMatch[0]
+  let data: Record<string, unknown> | null = null
+  const clients: [OpenAI, string, boolean][] = [
+    [client, predModel, useJsonMode],
+  ]
+  const directClient = getDirectOpenAIClient()
+  if (directClient && directClient !== client) {
+    clients.push([directClient, 'gpt-4o', true])
+  } else {
+    clients.push([client, getEffectiveAgentModel(), true])
+  }
 
-  const data = JSON.parse(raw)
-  const exec = data.suggested_execution || {}
-  const top = (markets[0] || {}) as Record<string, unknown>
-  const pred = buildPrediction(data, exec, top, query, wid, mode, balNum)
+  for (let attempt = 0; attempt < clients.length && !data; attempt++) {
+    const [usedClient, usedModel, usedJsonMode] = clients[attempt]
+    try {
+      const resp = await usedClient.chat.completions.create({
+        model: usedModel, temperature: 0.3, max_tokens: 2000,
+        ...(usedJsonMode ? { response_format: { type: 'json_object' } } : {}),
+        messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
+      })
+
+      let raw = resp.choices[0].message.content || '{}'
+      const jsonMatch = raw.match(/\{[\s\S]*\}/)
+      if (jsonMatch) raw = jsonMatch[0]
+
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      const lean = String(parsed.lean || '').toUpperCase()
+      const conf = Number(parsed.confidence) || 0
+      if ((lean !== 'YES' && lean !== 'NO') || conf <= 0) {
+        if (attempt === 0) {
+          console.log(`  ⚠ ${usedModel} returned weak prediction (lean=${lean}, conf=${conf}), retrying with direct fallback`)
+          continue
+        }
+      }
+      data = parsed
+      predModel = usedModel
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (attempt === clients.length - 1) throw new Error(`Prediction engine failed after ${clients.length} attempts: ${msg}`)
+      console.log(`  ⚠ ${usedModel} failed: ${msg}, retrying with direct fallback`)
+      if (msg.includes('Connection error') || msg.includes('ECONNREFUSED')) opseeqConsecutiveFailures++
+    }
+  }
+
+  const exec = data!.suggested_execution || {}
+  const thesis = String(data!.thesis || '').toLowerCase()
+  const matchedMarket = markets.find((raw: unknown) => {
+    const m = raw as Record<string, unknown>
+    const name = String(m.name || m.question || m.market_name || m.event_title || '').toLowerCase()
+    return name && (thesis.includes(name.slice(0, 20)) || name.includes(thesis.slice(0, 20)))
+  }) || markets[0]
+  const top = (matchedMarket || {}) as Record<string, unknown>
+  const pred = buildPrediction(data!, exec as Record<string, unknown>, top, query, wid, mode, balNum)
+  pred.model = predModel
 
   // Dedup/shadow: if same market/token was already predicted today (same mode), overwrite it in place
   const today = localDateStr()
@@ -344,7 +503,7 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
   const now = new Date().toISOString()
   if (existing) {
     const prev = JSON.parse(existing.snapshot_json) as Prediction
-    const keepCommittedState = prev.status === 'committed' || !!prev.orderId
+    const keepCommittedState = prev.status === 'committed' || prev.status === 'committed_live' || prev.status === 'committed_sim' || !!prev.orderId
     const merged: Prediction = {
       ...prev,
       ...pred,
@@ -352,7 +511,7 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
       createdAt: prev.createdAt || pred.createdAt,
       updatedAt: now,
       // Preserve outcome and execution state so re-predict shadows instead of duplicating cards.
-      status: prev.status === 'resolved' ? 'resolved' : (keepCommittedState ? 'committed' : pred.status),
+      status: prev.status === 'resolved' ? 'resolved' : (keepCommittedState ? prev.status : pred.status),
       orderId: prev.orderId || pred.orderId,
       orderStatus: prev.orderStatus || pred.orderStatus,
       resolvedAt: prev.resolvedAt || pred.resolvedAt,
@@ -372,11 +531,113 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
   predictionStore.insert({ id: pred.id, wallet_id: wid || '', mode, snapshot_json: JSON.stringify(pred), created_at: now, model_version: model })
   generateRunNote(pred.id, wid || '', mode, pred.thesis, pred.confidence, pred.action, pred.marketName, model)
   audit('generate_prediction', 'predict', { query, id: pred.id, mode, model })
+  emitTrace({ traceId: tId, stage: 'prediction_complete', action: 'generate_prediction', mode: mode === 'sim' ? 'simulation' : 'live', route, model: predModel, predictionId: pred.id, success: true, latencyMs: Date.now() - t0, detail: { lean: pred.lean, confidence: pred.confidence, amount: pred.amountUsdc, kelly: pred.kellyFraction, market: pred.marketName, tokenId: pred.tokenId?.slice(0, 20) } })
+  return pred
+}
+
+async function generateSwarmPrediction(query: string, markets: unknown[], walletId?: string, modeOverride?: 'real' | 'sim'): Promise<Prediction> {
+  const client = getInferenceClient()
+  const wid = walletId || defaultWalletId
+  const mode: 'real' | 'sim' = modeOverride || (SIM_MODE ? 'sim' : 'real')
+  const bal = await getCachedBalance(wid || '', mode)
+  const balNum = parseFloat(bal.total) || 0
+
+  const [newsData, recsData] = await Promise.all([
+    synth('/news?limit=6').catch(() => []),
+    synth('/recommendations?limit=6').catch(() => []),
+  ])
+
+  const headlines = (Array.isArray(newsData) ? newsData : [])
+    .map((n: unknown) => { const item = (n as Record<string, unknown>).news as Record<string, unknown> || n as Record<string, unknown>; return String(item.title || '') })
+    .filter(Boolean).slice(0, 8)
+
+  const enrichedMarkets = markets.slice(0, 12).map((raw: unknown) => {
+    const m = raw as Record<string, unknown>
+    return {
+      name: m.name || m.question || m.market_name || m.event_title,
+      yes_price: m.left_price || m.yes_price, no_price: m.right_price || m.no_price,
+      volume_24h: m.volume24hr || m.volume_24h, liquidity: m.liquidity,
+      ends_at: m.ends_at, venue: m.venue,
+      token_id: m.primary_token_id || m.left_token_id || m.token_id, condition_id: m.condition_id,
+    }
+  })
+
+  const contextBlock = headlines.length > 0
+    ? `\n\nRecent headlines:\n${headlines.map(h => `- ${h}`).join('\n')}`
+    : ''
+
+  const userMsg = `Query: "${query}"
+Wallet balance: $${bal.total} ${mode.toUpperCase()}
+Max per-prediction: $${(balNum * RISK.maxPerPredictionPct).toFixed(2)} (${RISK.maxPerPredictionPct * 100}% cap)
+Current time: ${new Date().toISOString()}${contextBlock}
+
+Markets (sorted by relevance):
+${JSON.stringify(enrichedMarkets, null, 2)}
+
+Pick the single best market matching the query. Analyze it deeply. Always provide a YES or NO lean with reasoning.`
+
+  const nimModel = getEffectivePredictionModel()
+  const gptModel = 'gpt-4o'
+
+  const runCall = async (model: string, useJson: boolean): Promise<Record<string, unknown> | null> => {
+    try {
+      const resp = await client.chat.completions.create({
+        model, temperature: 0.3, max_tokens: 2000,
+        ...(useJson ? { response_format: { type: 'json_object' as const } } : {}),
+        messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
+      })
+      let raw = resp.choices[0].message.content || '{}'
+      const jsonMatch = raw.match(/\{[\s\S]*\}/)
+      if (jsonMatch) raw = jsonMatch[0]
+      return JSON.parse(raw) as Record<string, unknown>
+    } catch (e) {
+      console.log(`  ⚠ Swarm call failed for ${model}: ${e instanceof Error ? e.message : e}`)
+      return null
+    }
+  }
+
+  const [nimResult, gptResult] = await Promise.all([
+    runCall(nimModel, !nimModel.startsWith('nvidia/')),
+    runCall(gptModel, true),
+  ])
+
+  let primary = gptResult || nimResult
+  let secondary = nimResult || gptResult
+  let swarmSources = [nimResult ? nimModel : null, gptResult ? gptModel : null].filter(Boolean) as string[]
+
+  if (!primary) throw new Error('Both swarm models failed to produce a prediction')
+
+  if (primary && secondary) {
+    const pConf = Number(primary.confidence) || 0
+    const sConf = Number(secondary.confidence) || 0
+    const pLean = String(primary.lean || '').toUpperCase()
+    const sLean = String(secondary.lean || '').toUpperCase()
+
+    if (sConf > pConf) { const tmp = primary; primary = secondary; secondary = tmp }
+
+    if (pLean === sLean && pLean) {
+      primary.confidence = Math.min(1, (Number(primary.confidence) || 0) + 0.05)
+      primary.rationale = `${String(primary.rationale || '')} [Swarm consensus: both ${swarmSources.join(' + ')} agree on ${pLean}]`
+    } else if (pLean !== sLean && sLean) {
+      primary.risk_note = `${String(primary.risk_note || '')} [Swarm divergence: ${swarmSources[0]} says ${pLean}, ${swarmSources[1]} says ${sLean}]`
+    }
+  }
+
+  const exec = (primary.suggested_execution || {}) as Record<string, unknown>
+  const top = (markets[0] || {}) as Record<string, unknown>
+  const pred = buildPrediction(primary, exec, top, query, wid, mode, balNum)
+  pred.model = swarmSources.join('+')
+
+  const now = new Date().toISOString()
+  predictionStore.insert({ id: pred.id, wallet_id: wid || '', mode, snapshot_json: JSON.stringify(pred), created_at: now, model_version: pred.model })
+  generateRunNote(pred.id, wid || '', mode, pred.thesis, pred.confidence, pred.action, pred.marketName, pred.model)
+  audit('generate_swarm_prediction', 'predict', { query, id: pred.id, mode, models: swarmSources })
   return pred
 }
 
 async function generateDualPrediction(query: string, markets: unknown[], walletId?: string): Promise<DualPrediction> {
-  if (!openai) throw new Error('OPENAI_API_KEY not set')
+  const client = getInferenceClient()
+  const model = getEffectivePredictionModel(activeModel)
 
   const wid = walletId || defaultWalletId
   const realBal = wid ? parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => [])) : { total: '0' }
@@ -409,30 +670,42 @@ Markets:\n${JSON.stringify(enrichedMarkets, null, 2)}
 
 Pick the best market. Always provide a YES or NO lean with reasoning.`
 
-  const useJsonMode = !activeModel.startsWith('o1') && !activeModel.startsWith('o3')
-  const resp = await openai.chat.completions.create({
-    model: activeModel, temperature: useJsonMode ? 0.3 : undefined, max_tokens: 2000,
-    ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
-    messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
-  })
+  const dualIsNim = model.startsWith('nvidia/')
+  const useJsonMode = !model.startsWith('o1') && !model.startsWith('o3') && !dualIsNim
 
-  let raw = resp.choices[0].message.content || '{}'
-  const jsonMatch = raw.match(/\{[\s\S]*\}/)
-  if (jsonMatch) raw = jsonMatch[0]
+  let dualData: Record<string, unknown> | null = null
+  for (let attempt = 0; attempt < 2 && !dualData; attempt++) {
+    const usedModel = attempt === 0 ? model : getEffectiveAgentModel()
+    const usedJsonMode = attempt === 0 ? useJsonMode : true
+    const resp = await client.chat.completions.create({
+      model: usedModel, temperature: 0.3, max_tokens: 2000,
+      ...(usedJsonMode ? { response_format: { type: 'json_object' } } : {}),
+      messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
+    })
 
-  const data = JSON.parse(raw)
-  const exec = data.suggested_execution || {}
+    let raw = resp.choices[0].message.content || '{}'
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (jsonMatch) raw = jsonMatch[0]
+
+    try { dualData = JSON.parse(raw) }
+    catch {
+      if (attempt === 1) throw new Error('Dual prediction returned malformed JSON after retry')
+      console.log(`  ⚠ ${usedModel} returned unparseable JSON for dual prediction, retrying with ${getEffectiveAgentModel()}`)
+    }
+  }
+
+  const exec = dualData!.suggested_execution || {}
   const top = (markets[0] || {}) as Record<string, unknown>
 
-  const realPred = buildPrediction(data, exec, top, query, wid, 'real', realBalNum)
-  const simExec = { ...exec, amount_usdc: Math.min(Number(exec.amount_usdc) || 0, simBalNum * RISK.maxPerPredictionPct) }
-  const simPred = buildPrediction(data, simExec, top, query, wid, 'sim', simBalNum)
+  const realPred = buildPrediction(dualData!, exec as Record<string, unknown>, top, query, wid, 'real', realBalNum)
+  const simExec = { ...exec, amount_usdc: Math.min(Number((exec as Record<string, unknown>).amount_usdc) || 0, simBalNum * RISK.maxPerPredictionPct) }
+  const simPred = buildPrediction(dualData!, simExec as Record<string, unknown>, top, query, wid, 'sim', simBalNum)
 
   const now = new Date().toISOString()
-  predictionStore.insert({ id: realPred.id, wallet_id: wid || '', mode: 'real', snapshot_json: JSON.stringify(realPred), created_at: now, model_version: activeModel })
-  predictionStore.insert({ id: simPred.id, wallet_id: wid || '', mode: 'sim', snapshot_json: JSON.stringify(simPred), created_at: now, model_version: activeModel })
+  predictionStore.insert({ id: realPred.id, wallet_id: wid || '', mode: 'real', snapshot_json: JSON.stringify(realPred), created_at: now, model_version: model })
+  predictionStore.insert({ id: simPred.id, wallet_id: wid || '', mode: 'sim', snapshot_json: JSON.stringify(simPred), created_at: now, model_version: model })
 
-  const noteId = generateRunNote(realPred.id, wid || '', 'real', realPred.thesis, realPred.confidence, realPred.action, realPred.marketName, activeModel)
+  const noteId = generateRunNote(realPred.id, wid || '', 'real', realPred.thesis, realPred.confidence, realPred.action, realPred.marketName, model)
 
   audit('generate_prediction', 'predict', { query, realId: realPred.id, simId: simPred.id, mode: 'both' })
 
@@ -549,7 +822,7 @@ async function maybeSyncPredictionResolutions(): Promise<void> {
   try { await syncPredictionResolutions(250) } catch {/**/}
 }
 
-// ── NemoClaw Agent Tools ──────────────────────────────────────────
+// ── Opseeq Agent Tools ───────────────────────────────────────────
 const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'think', description: 'Record an internal reasoning step. Use this to structure your multi-stage analysis before acting. Shows the user your thinking process.', parameters: { type: 'object', properties: { stage: { type: 'string', enum: ['observe', 'orient', 'research', 'analyze', 'decide', 'act'], description: 'OODA stage' }, thought: { type: 'string', description: 'Your reasoning at this stage' } }, required: ['stage', 'thought'] } } },
   { type: 'function', function: { name: 'fetch_markets', description: 'Search and score prediction markets. Returns top markets ranked by urgency, liquidity, volume. Include days param to filter by horizon.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' }, days: { type: 'number', description: 'Time horizon in days (default 7)' } } } } },
@@ -560,77 +833,104 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'research_topic', description: 'Fetch news and context about a specific prediction market topic. Use for fundamental research before generating a prediction.', parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Topic to research (e.g. "Nicolai Hojgaard golf", "Bitcoin price 2026")' }, limit: { type: 'number', description: 'Number of articles (default 8)' } }, required: ['topic'] } } },
   { type: 'function', function: { name: 'generate_prediction', description: 'Run the full AI prediction engine on a market. Returns thesis, confidence, lean (YES/NO), sizing, token_id, and market data.', parameters: { type: 'object', properties: { market_name: { type: 'string' } }, required: ['market_name'] } } },
   { type: 'function', function: { name: 'place_order', description: 'Place an actual market order. Requires prediction_id and token_id from generate_prediction output. In LIVE mode with REQUIRE_APPROVAL, queues to approvals.', parameters: { type: 'object', properties: { prediction_id: { type: 'string' }, token_id: { type: 'string' }, side: { type: 'string', enum: ['BUY', 'SELL'] }, amount: { type: 'string', description: 'USDC amount' }, order_type: { type: 'string', enum: ['MARKET', 'LIMIT'] }, price: { type: 'string', description: 'Limit price 0-1 (only for LIMIT)' } }, required: ['prediction_id', 'token_id', 'side', 'amount'] } } },
-  { type: 'function', function: { name: 'list_predictions', description: 'List predictions plus learning stats (accuracy, P&L, reflections) so NemoClaw can learn from resolved outcomes.', parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['both', 'sim', 'real'], description: 'Filter by mode' }, limit: { type: 'number' } } } } },
+  { type: 'function', function: { name: 'list_predictions', description: 'List predictions plus learning stats (accuracy, P&L, reflections) so Opseeq can learn from resolved outcomes.', parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['both', 'sim', 'real'], description: 'Filter by mode' }, limit: { type: 'number' } } } } },
   { type: 'function', function: { name: 'delete_prediction', description: 'Delete a prediction by ID. Use to clean up stale or unwanted predictions.', parameters: { type: 'object', properties: { prediction_id: { type: 'string' } }, required: ['prediction_id'] } } },
   { type: 'function', function: { name: 'clean_stale_predictions', description: 'Remove predictions for markets that have ended or resolve more than N days out and are not committed. Returns count of cleaned predictions.', parameters: { type: 'object', properties: { max_days_out: { type: 'number', description: 'Max days until resolution to keep (default 30)' } } } } },
+  { type: 'function', function: { name: 'fetch_approvals', description: 'List pending approvals so the user can execute or reject real-money orders.', parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['real', 'sim'] } } } } },
+  { type: 'function', function: { name: 'approve_order', description: 'Execute a queued approval by ID (real money if mode=real). Use only after explicit user YES.', parameters: { type: 'object', properties: { approval_id: { type: 'string' } }, required: ['approval_id'] } } },
+  { type: 'function', function: { name: 'reject_order', description: 'Reject a queued approval by ID. Use when user says NO or cancel.', parameters: { type: 'object', properties: { approval_id: { type: 'string' }, reason: { type: 'string' } }, required: ['approval_id'] } } },
   { type: 'function', function: { name: 'switch_tab', description: 'Navigate the dashboard to a specific tab.', parameters: { type: 'object', properties: { tab: { type: 'string', enum: ['dashboard', 'markets', 'predictions', 'approvals', 'audit', 'settings'] } }, required: ['tab'] } } },
-  { type: 'function', function: { name: 'highlight', description: 'Highlight a UI element with a gold glow.', parameters: { type: 'object', properties: { element: { type: 'string' }, message: { type: 'string' } }, required: ['element'] } } },
+  { type: 'function', function: { name: 'highlight', description: 'Highlight a UI element with an action style. selection=pink, await=orange, execute=green.', parameters: { type: 'object', properties: { element: { type: 'string' }, message: { type: 'string' }, tone: { type: 'string', enum: ['selection', 'await', 'execute'] }, action: { type: 'string', enum: ['hover', 'click'] } }, required: ['element'] } } },
   { type: 'function', function: { name: 'fetch_recommendations', description: 'Get personalized market recommendations from synthesis.trade.', parameters: { type: 'object', properties: {} } } },
 ]
 
-const AGENT_SYSTEM = `You are NemoClaw, the expert prediction agent inside Synth. Sharp, data-driven, and decisive. You always have a position.
+function buildAgentSystem(requestMode?: 'real' | 'sim'): string {
+  const isLive = requestMode === 'real' || (!requestMode && !SIM_MODE)
+  const wid = defaultWalletId || 'none'
+  return `You are Opseeq, a sharp prediction-market advisor guiding users through real trades. You are conversational, decisive, and action-oriented. Every message you send must move the user one step closer to a committed position.
 
-## CURRENT MODE: ${SIM_MODE ? 'SIMULATION (practice money, no real risk)' : 'LIVE (real money, real risk)'}
-## Default wallet: ${defaultWalletId || 'none'}
-## Prices: YES/NO prices are share costs (0.01-0.99). A YES share at $0.76 means 76% implied probability. If it resolves YES, you get $1/share → profit $0.24/share.
+MODE: ${isLive ? 'LIVE — real money at stake' : 'SIMULATION — practice money'}
+Wallet: ${wid}
+Share prices are 0.01–0.99. A YES share at $0.78 means 78% implied probability. If YES wins, payout is $1/share.
 
-## Multi-Stage Research Protocol
+## YOUR CONVERSATION FLOW
 
-For any prediction request, follow these stages. Use think() to log each stage so the user sees your reasoning.
+You guide the user through a multi-turn trade. Each turn advances to the next step. Never skip steps. Never leave the user without a clear next action.
 
-**Stage 1 — OBSERVE**
-Call think({stage:"observe", thought:"..."}) then: fetch_markets + fetch_balance in parallel. Note balance and affordable range.
+### Turn 1 — DISCOVER (when user asks for a bet)
+1. Call think({stage:"observe",...}) then fetch_markets + fetch_balance
+2. Call think({stage:"orient",...}) then pick the best market and explain WHY in 2 sentences
+3. Present the pick clearly:
+   - Market name, venue, time to close
+   - YES price / NO price (as probabilities)
+   - 24h volume and liquidity
+4. End with: **"I like [YES/NO] here. Want me to run a deep analysis? Just say 'go'."**
 
-**Stage 2 — ORIENT**
-Call think({stage:"orient", thought:"..."}) then: research_topic on the top market. Cross-reference with fetch_recommendations. Note what the data says about liquidity, volume, time to resolution.
+### Turn 2 — ANALYZE (when user says go, yes, analyze, etc.)
+1. Call think({stage:"research",...}) then get_price_history + get_market_stats
+2. Call think({stage:"analyze",...}) — synthesize price trend + fundamentals
+3. Call think({stage:"decide",...}) then generate_prediction
+4. Present the recommendation:
+   - **Direction:** YES or NO with 1-sentence thesis
+   - **Entry:** share price and implied probability
+   - **Confidence:** X% | **Edge:** +X% over market
+   - **Suggested wager:** $X (Y% of your $Z balance)
+5. End with: **"Ready to place $X on [YES/NO]? Say 'yes' or tell me a different amount."**
 
-**Stage 3 — RESEARCH (deep)**
-Call think({stage:"research", thought:"..."}) then: get_price_history on the best token_id to analyze price trend and momentum. Call get_market_stats for volume and open interest.
+### Turn 3 — COMMIT (when user says yes, $amount, do it, commit, place, etc.)
+1. Call think({stage:"act",...})
+2. IMMEDIATELY call place_order with the prediction_id, token_id, side, and amount from the previous generate_prediction result
+   - If user specified an amount like "$5", use "5"
+   - If user just said "yes", use the suggested amount
+   - amount MUST be a positive number string, NEVER "0"
+3. After place_order returns:
+   - **SIM mode:** Say "Done! Order placed: [orderId]. Check the Predictions tab." Call switch_tab("predictions") and highlight("prediction-list",...)
+   - **LIVE mode (queued to approvals):** Say "Order queued for your approval." Then:
+     a. Call switch_tab("approvals")
+     b. Call fetch_approvals to get the approval_id
+     c. Call highlight("approvals-list", "Your order is here", "await", "hover")
+     d. End with: **"Your live order is queued. Click the green Execute button above, or type 'execute' here to confirm."**
 
-**Stage 4 — ANALYZE**
-Call think({stage:"analyze", thought:"..."}) — synthesize all data. What does price trend say? Is the current price fair given the news? Where is the edge?
+### Turn 4 — EXECUTE (LIVE only — when user says execute, confirm, yes after queuing)
+1. Call fetch_approvals to get the pending approval_id
+2. Call approve_order(approval_id)
+3. Call fetch_balance to get updated balance
+4. Say: "Executed! Order filled. Your balance is now $X." Then call switch_tab("dashboard") and highlight("wallet-strip", "Balance updated", "execute", "hover")
+5. End with: **"Want to find the next opportunity?"**
 
-**Stage 5 — DECIDE**
-Call think({stage:"decide", thought:"..."}) then call generate_prediction. State: which direction, why, how much.
+### CANCEL flow (when user says no, cancel, reject)
+1. If there is a pending approval: call reject_order(approval_id, "User cancelled")
+2. Say: "Cancelled. No money moved." Then: **"Want to look at a different market?"**
 
-**Stage 6 — ACT**
-Present the finding:
-- **[MARKET NAME]** — ends in Xh/Xd
-- **Lean: YES @ $X.XX** or **NO @ $X.XX** — [1 sentence why]
-- **Confidence: X%** | **Edge: +X%** | **Kelly: X%**
-- **Wager: $X** (X% of your $Y balance)
-- **Price trend:** [brief from history — e.g. "rising from 0.12 to 0.17 in last 6h"]
-- **Volume:** $X.XX (24h) | **Liquidity:** $X.XX
-- **Source:** [link or news headline]
-Then: "Place this order? YES/NO, or name a different amount."
+## RECOGNITION RULES — detect user intent aggressively
 
-## When User Confirms (or says "commit", "place", "yes", "do it", etc.)
-- Call place_order with prediction_id, token_id, side, and the EXACT amount discussed
-- amount MUST be > 0. Use the suggested amount from generate_prediction. If user said "$5", use "5".
-- If queued to approvals (LIVE mode): tell user to check Approvals tab
-- If filled (SIM mode): confirm orderId and trigger celebration
+These ALL mean "confirm and place the order":
+- "yes", "yeah", "yep", "do it", "place it", "commit", "bet", "go ahead", "let's go", "send it", "place $X", "$X", any number like "5" or "10"
 
-## Lifecycle Management
-- Use list_predictions to see what's already been predicted
-- Use list_predictions learning stats (accuracy + reflections) to improve future picks
-- Use clean_stale_predictions to remove distant uncommitted predictions
-- Use delete_prediction to remove specific unwanted predictions
-- Proactively suggest cleanup if there are > 10 predictions
+These ALL mean "execute the queued live order":
+- "execute", "confirm", "approve", "yes" (when there is a pending approval), "do it"
 
-## Critical Rules
-- Use think() before every major step — the user can see your reasoning in real time
-- ALWAYS reference specific prices, volumes, timestamps from the data you fetched
-- ALWAYS include a source link or news headline in your final answer
-- Your token_id comes from generate_prediction output — always use it
-- amount in place_order MUST be a non-zero string like "5" or "10.50" — NEVER "0"
-- NEVER suggest a bet the user cannot afford. Check active_balance FIRST.
-- If user balance < $1: say so clearly. In SIM mode → recommend minting practice funds. In LIVE mode → recommend depositing via Settings > Deposit.
-- ALWAYS state the current mode (SIM/LIVE) when presenting a recommendation.
-- Prices: Express share prices as probabilities. "$0.76/share" → "76% chance". Don't just say "YES at $0.76" — say "YES (76% implied, 76¢/share)".
-- For crypto markets (BTC, ETH, SOL 15-min targets), these are great quick bets — suggest them
-- Vary your language, phrasing, and the order you present information
-- Keep final ACT message under 150 words but include all numbers
-- CRITICAL: Always end on a text message, never a tool call`
+These ALL mean "cancel":
+- "no", "cancel", "reject", "nevermind", "nah", "pass"
+
+These mean "start over with a new search":
+- "next", "different", "another", "find me", "what else"
+
+## IMPORTANT BEHAVIORAL RULES
+
+1. NEVER end a message without a clear next-step prompt for the user
+2. NEVER present data without telling the user what to do with it
+3. When the user confirms, ACT IMMEDIATELY — call place_order in the same turn, do not ask again
+4. After placing a LIVE order, ALWAYS switch to approvals tab and highlight the execute button
+5. Keep messages concise — max 100 words for recommendations, max 50 words for confirmations
+6. Always state the mode (SIM/LIVE) in your recommendation
+7. If balance < $1: say so clearly and suggest minting (SIM) or depositing (LIVE)
+8. Use think() at every stage transition — the user sees your reasoning live
+9. Use highlight() to guide the user's eyes to the right UI element
+10. Finish the current trade before suggesting a new one
+11. CRITICAL: Your token_id and prediction_id come from generate_prediction output. Always use them.
+12. CRITICAL: amount in place_order must be a positive string like "5" — never "0" or empty`
+}
 
 // Tool call has a stable shape at runtime; narrow it once here to avoid
 // repeated casts throughout the execution loop.
@@ -640,19 +940,40 @@ function asToolCall(tc: unknown): ToolCall {
   return tc as ToolCall
 }
 
+function ensureThinkStage(
+  commands: Array<{ type: string; payload: unknown }>,
+  stage: string,
+  thought: string,
+): void {
+  const exists = commands.some((cmd) => {
+    if (cmd.type !== 'think') return false
+    const payload = cmd.payload as { stage?: string }
+    return payload.stage === stage
+  })
+  if (exists) return
+  commands.push({
+    type: 'think',
+    payload: { stage, thought, enteredAt: new Date().toISOString() },
+  })
+}
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
   commands: Array<{ type: string; payload: unknown }>,
+  requestMode?: 'real' | 'sim',
 ): Promise<unknown> {
+  const effectiveMode: 'real' | 'sim' = requestMode || (SIM_MODE ? 'sim' : 'real')
   switch (name) {
     case 'think': {
       const stage = String(args.stage || 'think')
       const thought = String(args.thought || '')
-      commands.push({ type: 'think', payload: { stage, thought } })
-      return { stage, thought, acknowledged: true }
+      const enteredAt = new Date().toISOString()
+      commands.push({ type: 'think', payload: { stage, thought, enteredAt } })
+      return { stage, thought, enteredAt, acknowledged: true }
     }
     case 'fetch_markets': {
+      ensureThinkStage(commands, 'observe', 'Gathering live market candidates before narrowing to the best setup.')
       const q = String(args.query || '')
       const days = Number(args.days || horizonDays)
       const path = q
@@ -677,6 +998,7 @@ async function executeTool(
       }
     }
     case 'get_price_history': {
+      ensureThinkStage(commands, 'research', 'Reviewing recent price action and momentum on the selected market.')
       const tokenId = String(args.token_id || '')
       if (!tokenId) return { error: 'token_id required' }
       const fidelity = Number(args.fidelity || 60)
@@ -687,6 +1009,7 @@ async function executeTool(
       } catch (e) { return { error: String(e) } }
     }
     case 'get_market_stats': {
+      ensureThinkStage(commands, 'research', 'Checking liquidity, volume, and market quality before sizing.')
       const tokenId = String(args.token_id || '')
       if (!tokenId) return { error: 'token_id required' }
       try {
@@ -696,6 +1019,7 @@ async function executeTool(
       } catch (e) { return { error: String(e) } }
     }
     case 'research_topic': {
+      ensureThinkStage(commands, 'orient', 'Collecting topic context and event-specific information before committing.')
       const topic = String(args.topic || '')
       const limit = Number(args.limit || 8)
       const [news, searchResults] = await Promise.all([
@@ -716,19 +1040,21 @@ async function executeTool(
       return { topic, articles, related_markets: markets }
     }
     case 'fetch_balance': {
+      ensureThinkStage(commands, 'observe', 'Checking active balance and affordability constraints.')
       const wid = defaultWalletId
       if (!wid) return { error: 'No wallet detected' }
       commands.push({ type: 'tool', payload: { name: 'fetch_balance' } })
       const realBal = parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => []))
       const simBalData = simWallet.get(wid)
+      const isLive = effectiveMode === 'real'
       return {
-        mode: SIM_MODE ? 'simulation' : 'live',
-        active_balance: SIM_MODE ? simBalData : realBal,
+        mode: isLive ? 'live' : 'simulation',
+        active_balance: isLive ? realBal : simBalData,
         sim: simBalData,
         live: realBal,
-        note: SIM_MODE
-          ? `You are in SIMULATION mode. Practice balance: $${simBalData.total}. Live balance: $${realBal.total} (not used in sim).`
-          : `You are in LIVE mode. Real balance: $${realBal.total}. Orders use real money.`,
+        note: isLive
+          ? `You are in LIVE mode. Real balance: $${realBal.total}. Orders use real money.`
+          : `You are in SIMULATION mode. Practice balance: $${simBalData.total}. Live balance: $${realBal.total} (not used in sim).`,
       }
     }
     case 'fetch_positions': {
@@ -738,27 +1064,67 @@ async function executeTool(
       return synth(`/wallet/${wid}/positions`)
     }
     case 'generate_prediction': {
+      ensureThinkStage(commands, 'analyze', 'Running swarm analysis: parallel NIM + GPT-4o with news context.')
+      ensureThinkStage(commands, 'decide', 'Merging swarm results and selecting the optimal position.')
       const events = await synth(
         `/markets/search/${encodeURIComponent(String(args.market_name))}?limit=10`,
       ) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
       const flat = events.flatMap(ev =>
         ev.markets.map(m => ({ ...m, event_title: ev.event.title, venue: ev.venue, ends_at: m.ends_at || ev.event.ends_at })),
       )
-      const pred = await generatePrediction(String(args.market_name), flat, defaultWalletId || undefined)
-      commands.push({ type: 'tool', payload: { name: 'generate_prediction', prediction: pred.id } })
+      const useSwarm = opseeqAvailable && opseeqConsecutiveFailures < OPSEEQ_CIRCUIT_THRESHOLD
+      const pred = useSwarm
+        ? await generateSwarmPrediction(String(args.market_name), flat, defaultWalletId || undefined, effectiveMode)
+        : await generatePrediction(String(args.market_name), flat, defaultWalletId || undefined, undefined, effectiveMode)
+      commands.push({ type: 'tool', payload: { name: 'generate_prediction', prediction: pred.id, swarm: useSwarm } })
       return {
         id: pred.id, thesis: pred.thesis, confidence: pred.confidence,
         action: pred.action, side: pred.side, amount: pred.amountUsdc,
         market: pred.marketName, lean: pred.lean, leanReason: pred.leanReason,
         tokenId: pred.tokenId, yesPrice: pred.yesPrice, noPrice: pred.noPrice,
         minEntry: pred.minEntryUsdc, maxAffordable: pred.maxAffordableUsdc, venue: pred.venue,
+        mode: effectiveMode,
       }
     }
     case 'place_order': {
+      ensureThinkStage(commands, 'act', 'Turning the selected thesis into an executable order flow.')
+      const predictionId = String(args.prediction_id || '')
+      const tokenId = String(args.token_id || '')
+      const side = String(args.side || 'BUY')
+      const orderType = String(args.order_type || 'MARKET')
+      const amount = String(args.amount || '0')
+      const price = args.price ? String(args.price) : undefined
+      const safeAmount = effectiveMode === 'real' ? clampUsdAmount(parseFloat(amount) || EXCHANGE_MIN_USDC) : amount
+
+      if (REQUIRE_APPROVAL && effectiveMode === 'real') {
+        const approvalId = crypto.randomUUID().slice(0, 12)
+        approvalStore.insert({
+          id: approvalId,
+          type: 'place_order',
+          params_json: JSON.stringify({ tokenId, side, amount: safeAmount, orderType, price, predictionId }),
+          prediction_id: predictionId || null,
+          mode: 'real',
+          status: 'pending',
+          created_at: new Date().toISOString(),
+          resolved_at: null,
+          order_result_json: null,
+        })
+        audit('agent_order_approval_queued', 'order', { approvalId, predictionId, mode: 'real' })
+        commands.push({ type: 'tool', payload: { name: 'place_order', queued: true, approvalId } })
+        commands.push({ type: 'switch_tab', payload: 'approvals' })
+        commands.push({ type: 'highlight', payload: { element: 'approvals-list', message: 'Order queued. Awaiting your YES/NO.', tone: 'await', action: 'hover' } })
+        commands.push({ type: 'highlight', payload: { element: `approval-execute-${approvalId}`, message: 'Green = execute after YES', tone: 'execute', action: 'click' } })
+        return { queued: true, approvalId, message: 'Live order queued for approval. Type YES to execute or NO to reject.' }
+      }
+
       const result = await placeOrderViaApi(
-        String(args.prediction_id || ''), String(args.token_id || ''),
-        String(args.side || 'BUY'), String(args.amount || '0'),
-        String(args.order_type || 'MARKET'), args.price ? String(args.price) : undefined,
+        predictionId,
+        tokenId,
+        side,
+        safeAmount,
+        orderType,
+        price,
+        effectiveMode,
       )
       commands.push({ type: 'tool', payload: { name: 'place_order', order: result } })
       return result
@@ -804,7 +1170,7 @@ async function executeTool(
       let cleaned = 0
       for (const row of all) {
         const p = JSON.parse(row.snapshot_json)
-        if (p.status === 'committed' || p.orderId) continue
+        if (p.status === 'committed' || p.status === 'committed_live' || p.status === 'committed_sim' || p.orderId) continue
         if (p.endsAt && new Date(p.endsAt).getTime() > new Date(cutoff).getTime()) {
           db.prepare('DELETE FROM predictions WHERE id = ?').run(p.id)
           cleaned++
@@ -814,11 +1180,53 @@ async function executeTool(
       commands.push({ type: 'tool', payload: { name: 'clean_stale_predictions', cleaned } })
       return { cleaned, maxDays }
     }
+    case 'fetch_approvals': {
+      const mode = args.mode ? String(args.mode) : undefined
+      const rows = approvalStore.listPending(mode)
+      commands.push({ type: 'tool', payload: { name: 'fetch_approvals', count: rows.length } })
+      return rows.map(a => ({
+        id: a.id,
+        type: a.type,
+        mode: a.mode,
+        status: a.status,
+        createdAt: a.created_at,
+        params: JSON.parse(a.params_json),
+      }))
+    }
+    case 'approve_order': {
+      ensureThinkStage(commands, 'act', 'Executing the approved order and confirming completion.')
+      const approvalId = String(args.approval_id || '')
+      if (!approvalId) return { error: 'approval_id required' }
+      const out = await executeApprovalById(approvalId)
+      commands.push({ type: 'tool', payload: { name: 'approve_order', id: approvalId, status: out.status } })
+      commands.push({ type: 'switch_tab', payload: 'dashboard' })
+      commands.push({ type: 'highlight', payload: { element: 'wallet-strip', message: 'Order executed. Balance updated.', tone: 'execute', action: 'hover' } })
+      return out
+    }
+    case 'reject_order': {
+      ensureThinkStage(commands, 'act', 'Rejecting the queued order at the user’s request.')
+      const approvalId = String(args.approval_id || '')
+      if (!approvalId) return { error: 'approval_id required' }
+      const a = approvalStore.getById(approvalId)
+      if (!a) return { error: 'approval not found' }
+      approvalStore.updateStatus(a.id, 'rejected')
+      audit('reject', 'approve', { id: a.id, reason: args.reason })
+      commands.push({ type: 'tool', payload: { name: 'reject_order', id: approvalId } })
+      return { id: a.id, status: 'rejected' }
+    }
     case 'switch_tab':
       commands.push({ type: 'switch_tab', payload: args.tab })
       return { switched: args.tab }
     case 'highlight':
-      commands.push({ type: 'highlight', payload: { element: args.element, message: args.message || '' } })
+      commands.push({
+        type: 'highlight',
+        payload: {
+          element: args.element,
+          message: args.message || '',
+          tone: args.tone || 'await',
+          action: args.action || 'hover',
+        },
+      })
       return { highlighted: args.element }
     case 'fetch_recommendations': {
       const recs = await synth('/recommendations?limit=10') as unknown[]
@@ -840,15 +1248,34 @@ async function executeTool(
   }
 }
 
-async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): Promise<{ messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]; commands: Array<{ type: string; payload: unknown }> }> {
-  if (!openai) throw new Error('OPENAI_API_KEY not set')
+async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[], requestMode?: 'real' | 'sim'): Promise<{ messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]; commands: Array<{ type: string; payload: unknown }> }> {
+  let client = getInferenceClient()
   const commands: Array<{ type: string; payload: unknown }> = []
+  const systemPrompt = buildAgentSystem(requestMode)
+  let model = getEffectiveAgentModel()
+  const agentTraceId = traceId()
+  emitTrace({ traceId: agentTraceId, stage: 'agent_start', action: 'run_agent_turn', mode: (requestMode || (SIM_MODE ? 'sim' : 'real')) === 'sim' ? 'simulation' : 'live', route: currentRoute(), model, success: true })
 
-  const resp = await openai.chat.completions.create({
-    model: activeModel, temperature: 0.3, max_tokens: 2000,
-    tools: AGENT_TOOLS,
-    messages: [{ role: 'system', content: AGENT_SYSTEM }, ...messages],
-  })
+  let resp: Awaited<ReturnType<typeof client.chat.completions.create>>
+  try {
+    resp = await client.chat.completions.create({
+      model, temperature: 0.3, max_tokens: 2000,
+      tools: AGENT_TOOLS,
+      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+    })
+  } catch (e) {
+    const directOai = getDirectOpenAIClient()
+    if (!directOai) throw e
+    console.log(`  ⚠ Agent call failed via ${currentRoute()}: ${e instanceof Error ? e.message : e}, falling back to direct OpenAI`)
+    client = directOai
+    model = 'gpt-4o'
+    emitTrace({ traceId: agentTraceId, stage: 'agent_fallback', action: 'opseeq_to_direct', mode: (requestMode || (SIM_MODE ? 'sim' : 'real')) === 'sim' ? 'simulation' : 'live', route: 'fallback', model, success: true })
+    resp = await directOai.chat.completions.create({
+      model, temperature: 0.3, max_tokens: 2000,
+      tools: AGENT_TOOLS,
+      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+    })
+  }
 
   const choice = resp.choices[0]
   const out: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [...messages]
@@ -859,16 +1286,16 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
       const tc = asToolCall(rawTc)
       const args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>
       let result: unknown
-      try { result = await executeTool(tc.function.name, args, commands) }
+      try { result = await executeTool(tc.function.name, args, commands, requestMode) }
       catch (e) { result = { error: String(e) } }
       out.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
     }
 
-    for (let round = 0; round < 8; round++) {
-      const followUp = await openai.chat.completions.create({
-        model: activeModel, temperature: 0.3, max_tokens: 2000,
+    for (let round = 0; round < 4; round++) {
+      const followUp = await client.chat.completions.create({
+        model, temperature: 0.3, max_tokens: 2000,
         tools: AGENT_TOOLS,
-        messages: [{ role: 'system', content: AGENT_SYSTEM }, ...out],
+        messages: [{ role: 'system', content: systemPrompt }, ...out],
       })
       const msg = followUp.choices[0].message
       out.push(msg)
@@ -878,7 +1305,7 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
         const tc = asToolCall(rawTc)
         const args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>
         let result: unknown
-        try { result = await executeTool(tc.function.name, args, commands) }
+        try { result = await executeTool(tc.function.name, args, commands, requestMode) }
         catch (e) { result = { error: String(e) } }
         out.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
       }
@@ -887,14 +1314,49 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
     out.push(choice.message)
   }
 
+  const lastAssistantWithContent = [...out].reverse().find((msg) =>
+    typeof msg === 'object' &&
+    'role' in msg &&
+    msg.role === 'assistant' &&
+    typeof msg.content === 'string' &&
+    msg.content.trim().length > 0,
+  )
+
+  if (!lastAssistantWithContent) {
+    const finalResp = await client.chat.completions.create({
+      model,
+      temperature: 0.2,
+      max_tokens: 800,
+      tool_choice: 'none',
+      tools: AGENT_TOOLS,
+      messages: [
+        {
+          role: 'system',
+          content: `${systemPrompt}
+
+You must now give the user a final answer in plain language.
+- Summarize the best recommendation or the current result.
+- If a trade is ready, explicitly ask the next follow-up question.
+- ALWAYS end with a question or an explicit YES/NO prompt.
+- Do not call tools.`,
+        },
+        ...out,
+      ],
+    })
+    out.push(finalResp.choices[0].message)
+  }
+
   return { messages: out, commands }
 }
 
 // ── Order Placement ───────────────────────────────────────────────
 async function placeOrderViaApi(predictionId: string, tokenId: string, side: string, amount: string, orderType: string, price?: string, modeOverride?: 'real' | 'sim') {
+  const orderTraceId = traceId()
+  const orderT0 = Date.now()
   const wid = defaultWalletId
   if (!wid) throw new Error('No wallet available')
   const effectiveMode = modeOverride || (SIM_MODE ? 'sim' : 'real')
+  emitTrace({ traceId: orderTraceId, stage: 'order_start', action: 'place_order', mode: effectiveMode === 'sim' ? 'simulation' : 'live', route: currentRoute(), predictionId, success: true, detail: { tokenId: tokenId.slice(0, 20), side, amount, orderType } })
 
   if (effectiveMode === 'sim') {
     const amountNum = parseFloat(amount) || 0
@@ -906,11 +1368,12 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
       const pred = JSON.parse(row.snapshot_json)
       pred.orderId = simOrderId
       pred.orderStatus = 'SIMULATED'
-      pred.status = 'committed'
+      pred.status = 'committed_sim'
       db.prepare('UPDATE predictions SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(pred), predictionId)
     }
 
-    audit('place_order', 'order', { predictionId, tokenId, side, amount, orderType, mode: 'sim', orderId: simOrderId })
+    audit('place_order', 'order', { predictionId, tokenId, side, amount, orderType, mode: 'sim', orderId: simOrderId }, true, 'sim')
+    emitTrace({ traceId: orderTraceId, stage: 'order_complete', action: 'sim_order_filled', mode: 'simulation', route: 'direct', predictionId, orderId: simOrderId, success: true, latencyMs: Date.now() - orderT0, detail: { amount } })
     return { orderId: simOrderId, tokenId, side, type: orderType, amount, shares: '0', price: price || '0', status: 'SIMULATED', predictionId }
   }
 
@@ -997,11 +1460,14 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
     const pred = JSON.parse(row.snapshot_json)
     pred.orderId = orderId
     pred.orderStatus = String(orderResp.status || 'PENDING')
-    pred.status = 'committed'
+    pred.status = 'committed_live'
     db.prepare('UPDATE predictions SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(pred), predictionId)
   }
 
-  audit('place_order', 'order', { predictionId, tokenId, side, amount: usedAmount, orderType, mode: 'real', orderId })
+  audit('place_order', 'order', { predictionId, tokenId, side, amount: usedAmount, orderType, mode: 'real', orderId }, true, 'real')
+  emitTrace({ traceId: orderTraceId, stage: 'order_complete', action: 'live_order_filled', mode: 'live', route: 'direct', predictionId, orderId, success: true, latencyMs: Date.now() - orderT0, detail: { amount: usedAmount, autoSized: usedAmount !== clampedAmount, status: String(orderResp.status || 'PENDING') } })
+  invalidateBalanceCache(wid)
+  const balanceAfter = parseBalance(await synth(`/wallet/${wid}/balance`).catch(() => []))
   return {
     orderId, tokenId, side, type: orderType,
     amount: String(orderResp.amount || usedAmount || clampedAmount),
@@ -1011,6 +1477,72 @@ async function placeOrderViaApi(predictionId: string, tokenId: string, side: str
     predictionId,
     requestedAmount: amount,
     autoSized: usedAmount !== clampedAmount,
+    balanceAfter: { total: balanceAfter.total, available: balanceAfter.available },
+  }
+}
+
+// ── Opseeq Agent Gateway ──────────────────────────────────────────
+const OPSEEQ_URL = process.env.OPSEEQ_URL || 'http://127.0.0.1:9090'
+let opseeqAvailable = false
+let opseeqStatus: Record<string, unknown> | null = null
+let opseeqLastProbeAt = 0
+
+async function probeOpseeq(): Promise<boolean> {
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 2500)
+    const res = await fetch(`${OPSEEQ_URL}/health`, { signal: ctrl.signal })
+    clearTimeout(timer)
+    if (res.ok) {
+      opseeqStatus = await res.json() as Record<string, unknown>
+      try {
+        const modelsRes = await fetch(`${OPSEEQ_URL}/v1/models`, { signal: ctrl.signal })
+        if (modelsRes.ok) {
+          const modelsJson = await modelsRes.json() as { data?: Array<{ id?: string }> }
+          const liveModels = (modelsJson.data || []).map(m => String(m.id || '')).filter(Boolean)
+          const nimModels = liveModels.filter(m => m.startsWith('nvidia/'))
+          if (nimModels.length > 0) opseeqModels = nimModels
+        }
+      } catch {/**/}
+      opseeqAvailable = true
+      opseeqConsecutiveFailures = 0
+      opseeqLastProbeAt = Date.now()
+      return true
+    }
+  } catch {/**/}
+  opseeqAvailable = false
+  opseeqConsecutiveFailures++
+  opseeqStatus = null
+  opseeqLastProbeAt = Date.now()
+  if (opseeqConsecutiveFailures === OPSEEQ_CIRCUIT_THRESHOLD) {
+    console.log(`  ⚠ Opseeq circuit breaker tripped after ${OPSEEQ_CIRCUIT_THRESHOLD} failures — routing through direct OpenAI`)
+  }
+  return false
+}
+
+async function waitForOpseeqReady(timeoutMs = 20_000): Promise<boolean> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    if (await probeOpseeq()) return true
+    await sleep(1000)
+  }
+  return false
+}
+
+function tryLaunchOpseeq(): { launched: boolean; error?: string } {
+  if (opseeqAvailable) return { launched: true }
+  try {
+    const child = spawnProcess('docker', ['start', 'opseeq'], {
+      detached: true, stdio: 'ignore',
+    })
+    child.unref()
+    console.log('  🔷 Opseeq: starting Docker container…')
+    setTimeout(() => { void probeOpseeq() }, 5_000)
+    return { launched: true }
+  } catch (e) {
+    const msg = String(e)
+    console.error('  ⚠ Opseeq launch failed:', msg)
+    return { launched: false, error: msg }
   }
 }
 
@@ -1030,17 +1562,90 @@ app.get('/api/auth/verify', async (_req, res) => {
 app.get('/api/health', (_req, res) => {
   let predCount = 0; try { predCount = predictionStore.listAll(1).length } catch {/**/}
   const pendingApprovals = approvalStore.count('pending')
-  res.json({ status: 'ok', version: '1.0.0', simulation: SIM_MODE, approvalRequired: REQUIRE_APPROVAL, aiAvailable: !!openai, predictions: predCount, pendingApprovals, defaultWallet: defaultWalletId, authenticated: !!SECRET_KEY })
+  res.json({
+    status: 'ok', version: '1.0.0',
+    simulation: SIM_MODE, simulation_mode: SIM_MODE,
+    approvalRequired: REQUIRE_APPROVAL, approval_required: REQUIRE_APPROVAL,
+    aiAvailable: !!openai, ai_engine_available: !!openai,
+    predictions: predCount, predictions_available: predCount > 0,
+    pendingApprovals, defaultWallet: defaultWalletId, authenticated: !!SECRET_KEY,
+    opseeq: { available: opseeqAvailable, url: OPSEEQ_URL, circuitOpen: opseeqConsecutiveFailures >= OPSEEQ_CIRCUIT_THRESHOLD, failures: opseeqConsecutiveFailures },
+    runtime: { route: currentRoute(), predictionModel: getEffectivePredictionModel(activeModel), agentModel: getEffectiveAgentModel(), recentTraces: recentTraces.length },
+  })
+})
+
+app.get('/health', (_req, res) => {
+  let predCount = 0; try { predCount = predictionStore.listAll(1).length } catch {/**/}
+  res.json({
+    status: 'ok', version: '1.0.0',
+    simulation_mode: SIM_MODE, approval_required: REQUIRE_APPROVAL,
+    ai_engine_available: !!openai, predictions_available: predCount > 0,
+    predictions: predCount,
+  })
+})
+
+// Opseeq Agent Gateway endpoints
+app.get('/api/opseeq/status', async (_req, res) => {
+  const stale = Date.now() - opseeqLastProbeAt > 10_000
+  if (stale) await probeOpseeq()
+  res.json({
+    available: opseeqAvailable,
+    url: OPSEEQ_URL,
+    lastProbeAt: opseeqLastProbeAt ? new Date(opseeqLastProbeAt).toISOString() : null,
+    status: opseeqStatus,
+  })
+})
+
+app.post('/api/opseeq/launch', async (_req, res) => {
+  if (opseeqAvailable) return res.json({ already: true, url: OPSEEQ_URL })
+  const launch = tryLaunchOpseeq()
+  if (!launch.launched) return res.status(500).json({ error: launch.error || 'Failed to start Opseeq container' })
+  const ready = await waitForOpseeqReady(20_000)
+  res.json({ launching: true, ready, url: OPSEEQ_URL })
+})
+
+app.post('/api/opseeq/chat', async (req, res) => {
+  if (!opseeqAvailable) return res.status(503).json({ error: 'Opseeq gateway not available. Run: docker start opseeq' })
+  try {
+    const resp = await fetch(`${OPSEEQ_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    })
+    const data = await resp.json()
+    res.status(resp.status).json(data)
+  } catch (e) { res.status(502).json({ error: String(e) }) }
+})
+
+app.get('/api/opseeq/models', async (_req, res) => {
+  if (!opseeqAvailable) return res.status(503).json({ error: 'Opseeq gateway not available' })
+  try {
+    const resp = await fetch(`${OPSEEQ_URL}/v1/models`)
+    res.status(resp.status).json(await resp.json())
+  } catch (e) { res.status(502).json({ error: String(e) }) }
 })
 
 app.get('/api/config', (_req, res) => {
-  res.json({ simulation: SIM_MODE, confidenceThreshold: CONF_THRESH, requireApproval: REQUIRE_APPROVAL, model: activeModel, availableModels: AVAILABLE_MODELS, risk: RISK, horizonDays })
+  res.json({
+    simulation: SIM_MODE,
+    confidenceThreshold: CONF_THRESH,
+    requireApproval: REQUIRE_APPROVAL,
+    model: getEffectivePredictionModel(activeModel),
+    selectedModel: activeModel,
+    agentModel: getEffectiveAgentModel(),
+    predictionModel: getEffectivePredictionModel(activeModel),
+    availableModels: getAllAvailableModels(),
+    risk: RISK,
+    horizonDays,
+    opseeq: opseeqAvailable,
+  })
 })
 
 app.post('/api/config/model', (req, res) => {
   const { model } = req.body
-  if (!model || !AVAILABLE_MODELS.includes(model)) {
-    return res.status(400).json({ error: `Invalid model. Available: ${AVAILABLE_MODELS.join(', ')}` })
+  const all = getAllAvailableModels()
+  if (!model || !all.includes(model)) {
+    return res.status(400).json({ error: `Invalid model. Available: ${all.join(', ')}` })
   }
   activeModel = model
   audit('change_model', 'config', { model })
@@ -1245,12 +1850,13 @@ app.post('/api/predict', async (req, res) => {
   try {
     const { query, walletId, mode } = req.body
     if (!query) return res.status(400).json({ error: 'query required' })
+    const effectiveMode: 'real' | 'sim' | undefined = mode === 'real' ? 'real' : mode === 'sim' ? 'sim' : undefined
     const events = await synth(`/markets/search/${encodeURIComponent(query)}?limit=10`) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
     const flat = events.flatMap(ev => ev.markets.map(m => ({ ...m, event_title: ev.event.title, venue: ev.venue, ends_at: m.ends_at || ev.event.ends_at })))
     if (mode === 'both' || !mode) {
       res.json(await generateDualPrediction(query, flat, walletId || defaultWalletId))
     } else {
-      res.json(await generatePrediction(query, flat, walletId || defaultWalletId))
+      res.json(await generatePrediction(query, flat, walletId || defaultWalletId, undefined, effectiveMode))
     }
   } catch (e) { res.status(500).json({ error: String(e) }) }
 })
@@ -1319,7 +1925,7 @@ app.post('/api/predictions/clean', async (req, res) => {
     const removed: string[] = []
     for (const row of all) {
       const p = JSON.parse(row.snapshot_json)
-      if (p.status === 'committed' || p.orderId) continue
+      if (p.status === 'committed' || p.status === 'committed_live' || p.status === 'committed_sim' || p.orderId) continue
       const tooFar = p.endsAt && new Date(p.endsAt).getTime() > new Date(cutoff).getTime()
       if (tooFar) {
         db.prepare('DELETE FROM predictions WHERE id = ?').run(p.id)
@@ -1359,29 +1965,40 @@ app.get('/api/approvals', (req, res) => {
   res.json(rows.map(a => ({ id: a.id, type: a.type, params: JSON.parse(a.params_json), predictionId: a.prediction_id, mode: a.mode, status: a.status, createdAt: a.created_at })))
 })
 
-app.post('/api/approvals/:id/approve', async (req, res) => {
-  const a = approvalStore.getById(req.params.id)
-  if (!a) return res.status(404).json({ error: 'not found' })
-  audit('approve', 'approve', { id: a.id })
+async function executeApprovalById(id: string): Promise<{ id: string; status: string; orderResult?: unknown }> {
+  const approvalTraceId = traceId()
+  const a = approvalStore.getById(id)
+  if (!a) throw new Error('approval not found')
 
+  const approvalMode = a.mode === 'real' ? 'live' : 'simulation' as const
+  emitTrace({ traceId: approvalTraceId, stage: 'approval_execute', action: 'approve_order', mode: approvalMode, route: currentRoute(), approvalId: a.id, success: true, detail: { type: a.type, predictionId: a.prediction_id } })
+
+  audit('approve', 'approve', { id: a.id })
   if (a.type === 'place_order') {
-    try {
-      const p = JSON.parse(a.params_json) as { tokenId: string; side: string; amount: string; orderType: string; price?: string; predictionId?: string }
-      const safeAmount = clampUsdAmount(parseFloat(p.amount) || EXCHANGE_MIN_USDC)
-      const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, safeAmount, p.orderType, p.price, a.mode as 'real' | 'sim')
-      approvalStore.updateStatus(a.id, 'executed', JSON.stringify(result))
-      audit('order_executed', 'order', { approvalId: a.id, orderId: result.orderId, mode: a.mode })
-      return res.json({ id: a.id, status: 'executed', orderResult: result })
-    } catch (e) {
-      approvalStore.updateStatus(a.id, 'failed')
-      const message = parseSynthErrorMessage(e)
-      audit('order_failed', 'order', { approvalId: a.id, error: message })
-      return res.status(500).json({ error: message })
-    }
+    const p = JSON.parse(a.params_json) as { tokenId: string; side: string; amount: string; orderType: string; price?: string; predictionId?: string }
+    const safeAmount = clampUsdAmount(parseFloat(p.amount) || EXCHANGE_MIN_USDC)
+    const result = await placeOrderViaApi(p.predictionId || '', p.tokenId, p.side, safeAmount, p.orderType, p.price, a.mode as 'real' | 'sim')
+    approvalStore.updateStatus(a.id, 'executed', JSON.stringify(result))
+    const orderId = (result as Record<string, unknown>).orderId as string
+    audit('order_executed', 'order', { approvalId: a.id, orderId, mode: a.mode })
+    emitTrace({ traceId: approvalTraceId, stage: 'approval_complete', action: 'order_executed', mode: approvalMode, route: currentRoute(), approvalId: a.id, orderId, predictionId: p.predictionId, success: true, detail: { amount: safeAmount, status: (result as Record<string, unknown>).status } })
+    return { id: a.id, status: 'executed', orderResult: result }
   }
 
   approvalStore.updateStatus(a.id, 'approved')
-  res.json({ id: a.id, status: 'approved' })
+  return { id: a.id, status: 'approved' }
+}
+
+app.post('/api/approvals/:id/approve', async (req, res) => {
+  try { res.json(await executeApprovalById(req.params.id)) }
+  catch (e) {
+    const message = parseSynthErrorMessage(e)
+    console.error(`  ⚠ Approval ${req.params.id} failed:`, message)
+    if (message === 'approval not found') return res.status(404).json({ error: 'approval not found' })
+    approvalStore.updateStatus(req.params.id, 'failed')
+    audit('order_failed', 'order', { approvalId: req.params.id, error: message }, false, 'real')
+    return res.status(500).json({ error: message, approvalId: req.params.id })
+  }
 })
 
 app.post('/api/approvals/:id/reject', (req, res) => {
@@ -1398,6 +2015,26 @@ app.get('/api/audit', (_req, res) => {
   const lines = readFileSync(AUDIT_FILE, 'utf-8').trim().split('\n').filter(Boolean)
   const limit = parseInt(String(_req.query.limit) || '100')
   res.json(lines.slice(-limit).reverse().map(l => JSON.parse(l)))
+})
+
+app.get('/api/traces', (_req, res) => {
+  const limit = Math.min(parseInt(String(_req.query.limit) || '50'), MAX_TRACES)
+  const mode = _req.query.mode as string | undefined
+  const stage = _req.query.stage as string | undefined
+  let filtered = recentTraces.slice(-limit).reverse()
+  if (mode) filtered = filtered.filter(t => t.mode === mode)
+  if (stage) filtered = filtered.filter(t => t.stage === stage)
+  res.json({
+    traces: filtered,
+    total: recentTraces.length,
+    runtime: {
+      opseeq: { available: opseeqAvailable, route: currentRoute(), failures: opseeqConsecutiveFailures, circuitOpen: opseeqConsecutiveFailures >= OPSEEQ_CIRCUIT_THRESHOLD },
+      predictionModel: getEffectivePredictionModel(activeModel),
+      agentModel: getEffectiveAgentModel(),
+      mode: SIM_MODE ? 'simulation' : 'live',
+      uptime: process.uptime(),
+    },
+  })
 })
 
 // Price history for a specific token (Polymarket)
@@ -1489,12 +2126,13 @@ app.post('/api/kelly', (req, res) => {
   } catch (e) { res.status(400).json({ error: String(e) }) }
 })
 
-// NemoClaw Chat
+// Opseeq Chat
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages } = req.body
+    const { messages, mode: reqMode } = req.body
     if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'messages array required' })
-    const result = await runAgentTurn(messages)
+    const chatMode: 'real' | 'sim' | undefined = reqMode === 'real' ? 'real' : reqMode === 'sim' ? 'sim' : undefined
+    const result = await runAgentTurn(messages, chatMode)
     let content = ''
     for (let i = result.messages.length - 1; i >= 0; i--) {
       const msg = result.messages[i]
@@ -1510,7 +2148,12 @@ app.post('/api/chat', async (req, res) => {
         }
       }
     }
-    res.json({ reply: content || 'Analysis complete. Check the highlighted panels.', commands: result.commands, messageCount: result.messages.length })
+    res.json({
+      reply: content || 'Analysis complete. Check the highlighted panels.',
+      commands: result.commands,
+      messageCount: result.messages.length,
+      inference: { model: getEffectiveAgentModel(), route: opseeqAvailable ? 'opseeq' : 'direct', gateway: opseeqAvailable ? OPSEEQ_URL : null },
+    })
   } catch (e) { res.status(500).json({ error: String(e) }) }
 })
 
@@ -1522,16 +2165,21 @@ if (existsSync(distDir)) {
 }
 
 // Start
-refreshWallets().then(() => {
+refreshWallets().then(async () => {
   if (defaultWalletId) simWallet.ensureExists(defaultWalletId, cachedWallets[0]?.name)
   const predCount = predictionStore.listAll(1).length
   startAggregationWorker(openai, activeModel)
   startCompactionWorker()
   setTimeout(() => { void syncPredictionResolutions(300) }, 5000)
   setInterval(() => { void syncPredictionResolutions(300) }, 60_000)
+
+  const opseeqUp = await probeOpseeq()
+  setInterval(() => { void probeOpseeq() }, 12_000)
+
   app.listen(PORT, HOST, () => {
     console.log(`\n  ⚡ Synth server running at http://127.0.0.1:${PORT}`)
     console.log(`  📊 ${SIM_MODE ? 'SIMULATION' : 'LIVE'} mode | AI: ${openai ? '✓' : '✗'} | DB predictions: ${predCount}`)
-    console.log(`  💰 Sim wallet: $${defaultWalletId ? simWallet.getTotal(defaultWalletId) : 0}\n`)
+    console.log(`  💰 Sim wallet: $${defaultWalletId ? simWallet.getTotal(defaultWalletId) : 0}`)
+    console.log(`  🔷 Opseeq: ${opseeqUp ? `connected at ${OPSEEQ_URL}` : `watching ${OPSEEQ_URL} (will auto-detect)`}\n`)
   })
 })

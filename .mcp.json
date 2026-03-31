@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "opseeq": {
+      "url": "http://localhost:9090/mcp",
+      "transport": "sse"
+    },
+    "mermate": {
+      "url": "http://localhost:3333/mcp",
+      "transport": "sse"
+    }
+  }
+}

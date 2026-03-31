@@ -64,8 +64,17 @@ export interface Note { id: string; tag: string; content: string; period: string
 
 export interface ChatMessage { role: 'user' | 'assistant'; content: string }
 export interface AgentCommand { type: 'switch_tab' | 'highlight' | 'tool' | 'think'; payload: unknown }
-export interface ThinkCommand { stage: string; thought: string }
-export interface HighlightCommand { element: string; message: string }
+export interface ThinkCommand {
+  stage: string
+  thought: string
+  enteredAt?: string
+}
+export interface HighlightCommand {
+  element: string
+  message: string
+  tone?: 'selection' | 'await' | 'execute'
+  action?: 'hover' | 'click'
+}
 
 export type WalletMode = 'real' | 'sim'
 export type Tab = 'dashboard' | 'markets' | 'predictions' | 'approvals' | 'audit' | 'settings'
@@ -102,6 +111,7 @@ export interface OrderResult {
   predictionId?: string
   requestedAmount?: string
   autoSized?: boolean
+  balanceAfter?: { total: string; available: string }
 }
 
 // Deposit / Withdraw types

@@ -45,8 +45,10 @@ export const simWallet = {
   },
 
   debit(realWalletId: string, amount: number): SimBalance {
+    if (amount <= 0) return this.get(realWalletId)
     const current = this.getTotal(realWalletId)
-    const next = Math.max(0, current - amount)
+    if (amount > current) throw new Error(`Insufficient sim balance: have $${current.toFixed(2)}, need $${amount.toFixed(2)}`)
+    const next = current - amount
     return this._set(realWalletId, next)
   },
 

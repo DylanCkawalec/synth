@@ -31,7 +31,7 @@ The Dashboard is the home screen. It shows three panels:
 
 - **Left — Positions**: Your open and closed bets. Toggle between `Open` and `Closed` to review active wagers vs. settled results. Each card shows the market name, wager size, implied probability, confidence, and days until resolution.
 - **Center — Closing Soon / Crypto**: Markets about to resolve, sorted by time remaining. Each row shows the market question, the current YES/NO probability split, and time left. Tap any row to generate a prediction.
-- **Right — NemoClaw Agent**: The AI assistant panel. Use the quick-action buttons to find the best crypto bet, commit a specific dollar amount, view affordable options, clean up stale predictions, or show your P&L. You can also type free-form questions.
+- **Right — Opseeq Agent**: The AI assistant panel. Use the quick-action buttons to find the best crypto bet, commit a specific dollar amount, view affordable options, clean up stale predictions, or show your P&L. You can also type free-form questions.
 
 **Key buttons:**
 - The top nav bar has tabs for **Dashboard**, **Markets**, **Predictions**, **Approvals**, **Audit**, and **Settings**.
@@ -286,7 +286,7 @@ Settings provides four tabs: **Wallet**, **Deposit**, **Withdraw**, **Config**.
 
 ## Agent Integration
 
-NemoClaw MCP server exposes agent tools:
+Opseeq MCP server exposes agent tools:
 
 - `fetch_markets` — Search and score prediction markets
 - `fetch_balance` — Get wallet balance across chains

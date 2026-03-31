@@ -56,6 +56,10 @@ const cc = (c: number) => c >= .75 ? 'bg-s-green' : c >= .5 ? 'bg-s-accent' : c 
 const uIcons: Record<string, string> = { critical: '🔴', soon: '🟡', normal: '🟢', distant: '⚪', ended: '⚫' }
 const pct = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}%` }
 const cost = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}¢` }
+const ts = (iso?: string) => {
+  if (!iso) return ''
+  return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+}
 
 function truncAddr(addr: string, n = 6) { return addr ? `${addr.slice(0, n)}...${addr.slice(-4)}` : '' }
 function isValidEvmAddress(addr: string) { return /^0x[a-fA-F0-9]{40}$/.test(addr) }
@@ -175,7 +179,7 @@ function Sparkline({ points, width = 120, height = 32, color = '#00ffb4' }: { po
   )
 }
 
-// Stage icons for NemoClaw thinking
+// Stage icons for Opseeq thinking
 const STAGE_ICONS: Record<string, string> = { observe: '👁', orient: '🧭', research: '🔍', analyze: '📊', decide: '⚡', act: '🎯' }
 const STAGE_COLORS: Record<string, string> = { observe: 'text-s-blue', orient: 'text-s-accent', research: 'text-purple-400', analyze: 'text-yellow-400', decide: 'text-s-warn', act: 'text-s-green' }
 
@@ -208,13 +212,19 @@ export default function App() {
   const [autoMode, setAutoMode] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
+  // Opseeq Agent Gateway integration
+  const [opseeqAvailable, setOpseeqAvailable] = useState(false)
+  const [opseeqUrl, setOpseeqUrl] = useState('http://127.0.0.1:9090')
+  const [opseeqPanel, setOpseeqPanel] = useState(false)
+  const [lastInference, setLastInference] = useState<{ model: string; route: string; gateway: string | null } | null>(null)
+
   // Celebrations
   const [celebration, setCelebration] = useState<CelebType | null>(null)
   const triggerCelebration = useCallback((type: CelebType) => {
     setCelebration(type)
   }, [])
 
-  // Think messages from NemoClaw
+  // Think messages from Opseeq
   const [thinkLog, setThinkLog] = useState<ThinkCommand[]>([])
 
   // Price history cache per tokenId
@@ -223,6 +233,9 @@ export default function App() {
 
   // Approvals filter
   const [approvalFilter, setApprovalFilter] = useState<'all' | 'live' | 'sim'>('all')
+
+  // Predictions mode filter
+  const [predModeFilter, setPredModeFilter] = useState<'all' | 'live' | 'sim'>('all')
 
   // Position view tabs
   const [positionView, setPositionView] = useState<'open' | 'closed'>('open')
@@ -233,7 +246,7 @@ export default function App() {
   const [mintLoading, setMintLoading] = useState(false)
 
   // Highlights
-  const [highlights, setHighlights] = useState<Map<string, string>>(new Map())
+  const [highlights, setHighlights] = useState<Map<string, HighlightCommand>>(new Map())
 
   // Wallet/Deposit/Withdraw
   const [settingsTab, setSettingsTab] = useState<'wallet' | 'deposit' | 'withdraw' | 'config'>('wallet')
@@ -282,7 +295,7 @@ export default function App() {
   useEffect(() => { document.documentElement.setAttribute('data-theme', theme) }, [theme])
 
   const addHighlight = useCallback((cmd: HighlightCommand) => {
-    setHighlights(prev => new Map(prev).set(cmd.element, cmd.message))
+    setHighlights(prev => new Map(prev).set(cmd.element, cmd))
     setTimeout(() => setHighlights(prev => { const n = new Map(prev); n.delete(cmd.element); return n }), 3500)
   }, [])
 
@@ -291,6 +304,10 @@ export default function App() {
       setWallets(w)
       if (defaultWalletId) setWid(defaultWalletId)
       else if (w.length > 0) setWid(w[0].wallet_id)
+    }).catch(() => {})
+    api.getConfig().then(c => {
+      setConfig(c)
+      if (c.simulation) setWMode('sim')
     }).catch(() => {})
   }, [])
 
@@ -310,8 +327,40 @@ export default function App() {
     setLastRefresh(Date.now())
   }, [wid, wMode, config?.horizonDays])
 
-  useEffect(() => { refresh() }, [refresh])
-  useEffect(() => { const iv = setInterval(refresh, 12_000); return () => clearInterval(iv) }, [refresh])
+  const refreshingRef = useRef(false)
+  const debouncedRefresh = useCallback(async () => {
+    if (refreshingRef.current) return
+    refreshingRef.current = true
+    try { await refresh() } finally { refreshingRef.current = false }
+  }, [refresh])
+
+  useEffect(() => { debouncedRefresh() }, [debouncedRefresh])
+  useEffect(() => {
+    let iv: ReturnType<typeof setInterval>
+    const start = () => { iv = setInterval(debouncedRefresh, document.hidden ? 60_000 : 15_000) }
+    const onVis = () => { clearInterval(iv); start() }
+    start()
+    document.addEventListener('visibilitychange', onVis)
+    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', onVis) }
+  }, [debouncedRefresh])
+
+  useEffect(() => {
+    let mounted = true
+    const poll = async () => {
+      try {
+        const s = await api.getOpseeqStatus()
+        if (!mounted) return
+        setOpseeqAvailable(!!s.available)
+        setOpseeqUrl(s.url || 'http://127.0.0.1:9090')
+      } catch {
+        if (!mounted) return
+        setOpseeqAvailable(false)
+      }
+    }
+    void poll()
+    const iv = setInterval(() => { void poll() }, 15_000)
+    return () => { mounted = false; clearInterval(iv) }
+  }, [])
 
   const predict = async (query: string, navigate = true) => {
     setLoading(true)
@@ -402,7 +451,7 @@ export default function App() {
           : ''
         flash(isSim
           ? `Practice bet placed: ${result.orderId?.slice(0, 12)}...${autoSizedMsg}`
-          : `🎆 Live order executed: ${result.orderId?.slice(0, 12)}...${autoSizedMsg}`)
+          : `🎆 Live order executed: ${result.orderId?.slice(0, 12)}...${autoSizedMsg}${result.balanceAfter?.total ? ` • Balance: $${f(result.balanceAfter.total)}` : ''}`)
         triggerCelebration(isSim ? 'confetti' : 'fireworks')
         setTab('dashboard')
         await refresh()
@@ -481,7 +530,7 @@ export default function App() {
     return new Date(endsAt).getTime() < Date.now()
   }
 
-  // NemoClaw chat
+  // Opseeq chat
   const sendChat = async (text: string) => {
     if (!text.trim()) return
     const userMsg: ChatMessage = { role: 'user', content: text }
@@ -491,7 +540,9 @@ export default function App() {
     setChatLoading(true)
     try {
       setThinkLog([])
-      const { reply, commands } = await api.chat(newMsgs.map(m => ({ role: m.role, content: m.content })))
+      const resp = await api.chat(newMsgs.map(m => ({ role: m.role, content: m.content })), wMode === 'sim' ? 'sim' : 'real')
+      const { reply, commands } = resp
+      if ((resp as Record<string, unknown>).inference) setLastInference((resp as Record<string, unknown>).inference as typeof lastInference)
       const thinks: ThinkCommand[] = []
       for (const cmd of commands || []) {
         if (cmd.type === 'switch_tab') setTab(cmd.payload as Tab)
@@ -500,16 +551,16 @@ export default function App() {
       }
       setThinkLog(thinks)
       setChatMsgs(prev => [...prev, { role: 'assistant', content: reply || 'Done.' }])
-      await refresh()
+      debouncedRefresh()
     } catch (e) { setChatMsgs(prev => [...prev, { role: 'assistant', content: `Error: ${e instanceof Error ? e.message : 'Failed'}` }]) }
     finally { setChatLoading(false) }
   }
 
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMsgs])
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMsgs, thinkLog, chatLoading])
 
   useEffect(() => {
     if (!autoMode) return
-    const run = () => sendChat('Run the OODA loop: observe markets and balance, orient on the best near-term opportunity, decide on a prediction, and act by presenting it.')
+    const run = () => sendChat('Run the full OODA loop end-to-end: learn from recent prediction outcomes, pick the best market, generate a prediction, queue/place the order, and finish the current trade lifecycle before moving on.')
     const iv = setInterval(run, 90_000)
     run()
     return () => clearInterval(iv)
@@ -622,14 +673,18 @@ export default function App() {
   // Deduplicate: one card per market+mode combination, latest wins
   // Committed positions are always kept; generated are deduped by market+day
   const dedupedPreds = useMemo(() => {
-    // First pass: collect all committed predictions (keep all)
-    const committed = preds.filter(p => p.status === 'committed' || !!p.orderId)
-    // Second pass: deduplicate generated ones
+    const modeMatch = (p: Prediction) =>
+      predModeFilter === 'all' ||
+      (predModeFilter === 'live' && p.mode !== 'sim') ||
+      (predModeFilter === 'sim' && p.mode === 'sim')
+    const isCommittedStatus = (s: string) => s === 'committed' || s === 'committed_live' || s === 'committed_sim'
+    const committed = preds.filter(p => (isCommittedStatus(p.status) || !!p.orderId) && modeMatch(p))
     const seen = new Map<string, Prediction>()
     const maxDaysOut = 60
     for (const p of preds) {
-      if (p.status === 'committed' || !!p.orderId) continue
+      if (isCommittedStatus(p.status) || !!p.orderId) continue
       if (p.status === 'resolved') continue
+      if (!modeMatch(p)) continue
       if (p.endsAt) {
         const daysOut = (new Date(p.endsAt).getTime() - Date.now()) / 864e5
         if (daysOut > maxDaysOut || daysOut < 0) continue
@@ -639,8 +694,8 @@ export default function App() {
       if (!seen.has(key)) seen.set(key, p)
     }
     const generated = [...seen.values()]
-    const all = [...committed, ...generated, ...resolvedPreds].sort((a, b) => {
-      // Sort: resolved last, then by time remaining ASC (soonest first)
+    const filteredResolved = resolvedPreds.filter(modeMatch)
+    const all = [...committed, ...generated, ...filteredResolved].sort((a, b) => {
       const aResolved = a.status === 'resolved'
       const bResolved = b.status === 'resolved'
       if (aResolved !== bResolved) return aResolved ? 1 : -1
@@ -648,10 +703,9 @@ export default function App() {
       const bEnds = b.endsAt ? new Date(b.endsAt).getTime() : Infinity
       return aEnds - bEnds
     })
-    // Remove pure duplicates (same id)
     const ids = new Set<string>()
     return all.filter(p => { if (ids.has(p.id)) return false; ids.add(p.id); return true })
-  }, [preds, resolvedPreds])
+  }, [preds, resolvedPreds, predModeFilter])
 
   // Group by dateLabel for section headers
   const groupedPreds = useMemo(() => {
@@ -688,12 +742,32 @@ export default function App() {
     return null
   }, [metaMask, settingsTab, depositChain, withdrawChain, withdrawUseMetaMask])
 
-  const hl = (id: string) => highlights.has(id) ? 'ring-2 ring-yellow-400/60 shadow-[0_0_20px_rgba(250,204,21,0.3)] transition-all duration-500' : 'transition-all duration-500'
-  const hlTooltip = (id: string) => highlights.has(id)
-    ? <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-yellow-400 text-black text-[10px] font-bold px-2 py-0.5 rounded whitespace-nowrap z-50 animate-pulse">{highlights.get(id)}</div>
-    : null
+  const hl = (id: string) => {
+    const h = highlights.get(id)
+    if (!h) return 'transition-all duration-500'
+    const tone = h.tone || 'await'
+    const toneCls = tone === 'selection'
+      ? 'ring-pink-400/80 shadow-[0_0_24px_rgba(244,114,182,0.35)]'
+      : tone === 'execute'
+        ? 'ring-emerald-400/80 shadow-[0_0_24px_rgba(16,185,129,0.35)]'
+        : 'ring-orange-300/80 shadow-[0_0_24px_rgba(251,146,60,0.35)]'
+    const actionCls = h.action === 'click' ? 'animate-pulse' : 'animate-[pulse_1.6s_ease-in-out_infinite]'
+    return `ring-2 ${toneCls} ${actionCls} transition-all duration-500`
+  }
+  const hlTooltip = (id: string) => {
+    const h = highlights.get(id)
+    if (!h) return null
+    const tone = h.tone || 'await'
+    const tipCls = tone === 'selection'
+      ? 'bg-pink-400 text-black'
+      : tone === 'execute'
+        ? 'bg-emerald-400 text-black'
+        : 'bg-orange-300 text-black'
+    return <div className={`absolute -top-8 left-1/2 -translate-x-1/2 text-[10px] font-bold px-2 py-0.5 rounded whitespace-nowrap z-50 animate-pulse ${tipCls}`}>{h.message || 'Focus here'}</div>
+  }
 
   const toggleMode = () => setWMode(prev => prev === 'real' ? 'sim' : 'real')
+  const rightDockPx = (chatOpen ? 360 : 0) + (opseeqPanel ? 560 : 0)
 
   return (
     <div className="min-h-screen flex flex-col font-sans text-[13px]">
@@ -708,11 +782,12 @@ export default function App() {
         const leanPrice = commitDir === 'YES' ? p.yesPrice : p.noPrice
         const amt = parseFloat(commitAmt) || 0
         const exchangeMin = isSim ? 0.10 : 1.00
-        const minE = Math.max(exchangeMin, leanPrice > 0 ? leanPrice : (p.minEntryUsdc || exchangeMin))
-        const maxA = Math.min(p.maxAffordableUsdc || 100, modeTotal * 0.10)
+        const shareFloor = leanPrice > 0 && leanPrice < 1 ? leanPrice : 0
+        const minE = Math.max(exchangeMin, shareFloor, p.minEntryUsdc || 0)
+        const maxA = Math.max(minE, Math.min(p.maxAffordableUsdc || 1000, modeTotal))
         const canAffordAnything = modeTotal >= minE
         const estShares = leanPrice > 0 ? (amt / leanPrice) : 0
-        const quickAmts = [1, 5, 10, 25, 50, 100].filter(a => a >= minE && a <= maxA)
+        const quickAmts = [1, 2, 5, 10, 25, 50, 100].filter(a => a >= minE && a <= maxA)
         const isPlacing = orderLoading === p.id
         return (
           <div className="fixed inset-0 z-[900] flex items-center justify-center" onClick={() => !isPlacing && setCommitModal(null)}>
@@ -850,7 +925,7 @@ export default function App() {
                     title="Generate a new AI analysis for this market">
                     ↻ Re-predict
                   </button>
-                  <button onClick={confirmCommit} disabled={isPlacing || amt < minE || amt > modeTotal || !canAffordAnything}
+                  <button onClick={confirmCommit} disabled={isPlacing || amt <= 0 || amt > maxA || !canAffordAnything}
                     className={`flex-1 py-3.5 rounded-lg text-sm font-black transition-all disabled:opacity-40 ${
                       isSim
                         ? 'bg-s-green text-black hover:brightness-110 shadow-lg shadow-s-green/20'
@@ -888,8 +963,18 @@ export default function App() {
           ))}
         </nav>
         <div className="flex items-center gap-3">
+          <button onClick={() => setOpseeqPanel(!opseeqPanel)}
+            className={`text-[10px] px-2 py-1 rounded font-semibold transition-all ${opseeqPanel ? 'bg-s-blue text-black' : 'bg-s-elevated text-s-muted hover:text-s-text'}`}>
+            Console
+          </button>
+          {!opseeqAvailable && (
+            <button onClick={() => api.launchOpseeq().then(() => flash('Starting Opseeq...')).catch(() => flash('Failed to start Opseeq'))}
+              className="text-[10px] px-2 py-1 rounded font-semibold bg-s-warn/20 text-s-warn hover:brightness-110">
+              Start Opseeq
+            </button>
+          )}
           <button onClick={() => setChatOpen(!chatOpen)} className={`text-[10px] px-2 py-1 rounded font-semibold transition-all ${chatOpen ? 'bg-s-accent text-black' : 'bg-s-elevated text-s-muted hover:text-s-text'}`}>
-            NemoClaw
+            Opseeq
           </button>
           <span className={`w-2 h-2 rounded-full ${health?.status === 'ok' ? 'bg-s-green shadow-[0_0_6px] shadow-s-green' : 'bg-s-danger'}`} />
         </div>
@@ -950,7 +1035,7 @@ export default function App() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Main content */}
-        <main className={`flex-1 p-3 overflow-y-auto transition-all duration-300 min-h-0 ${chatOpen ? 'mr-[360px]' : ''}`}>
+        <main className="flex-1 p-3 overflow-y-auto transition-all duration-300 min-h-0" style={{ marginRight: rightDockPx > 0 ? `${rightDockPx}px` : undefined }}>
           {toast && <div className="fixed top-14 right-5 bg-s-panel border border-s-accent text-s-text px-4 py-2.5 rounded text-xs z-50 animate-[slideIn_0.2s_ease-out]">{toast}</div>}
 
           {/* ── DASHBOARD ── */}
@@ -1270,6 +1355,16 @@ export default function App() {
                   }} className="text-[10px] text-s-muted hover:text-s-danger px-1.5 py-0.5 rounded bg-s-elevated" title="Remove distant uncommitted predictions">
                     Clean up
                   </button>
+                  <div className="flex bg-s-elevated rounded p-0.5 ml-2">
+                    {(['all', 'live', 'sim'] as const).map(fm => (
+                      <button key={fm} onClick={() => setPredModeFilter(fm)}
+                        className={`px-2 py-0.5 rounded text-[9px] font-bold transition-all ${
+                          predModeFilter === fm
+                            ? fm === 'live' ? 'bg-s-warn text-black' : fm === 'sim' ? 'bg-s-blue text-white' : 'bg-s-accent text-black'
+                            : 'text-s-muted hover:text-s-text'
+                        }`}>{fm === 'all' ? 'ALL' : fm === 'live' ? 'LIVE' : 'SIM'}</button>
+                    ))}
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <input className="bg-s-bg border border-s-border rounded px-2.5 py-1.5 text-xs text-s-text outline-none focus:border-s-accent min-w-[250px]"
@@ -1290,12 +1385,23 @@ export default function App() {
                   const cl = confLabel(p.confidence)
                   const ended = marketEnded(p.endsAt)
                   const isExpanded = expanded.has(p.id)
-                  const isCommitted = p.status === 'committed' || p.orderId
+                  const isCommitted = p.status === 'committed' || p.status === 'committed_live' || p.status === 'committed_sim' || !!p.orderId
+                  const isLiveCommitted = isCommitted && p.mode !== 'sim'
                   return (
-                  <div key={p.id} className={`bg-s-panel border rounded-lg overflow-hidden ${isCommitted ? 'border-yellow-400/50 shadow-[0_0_12px_rgba(250,204,21,0.15)]' : 'border-s-border'}`}>
+                  <div key={p.id} data-synth-id={`prediction-${p.id}`} className={`bg-s-panel border rounded-lg overflow-hidden ${
+                    isLiveCommitted ? 'border-purple-500/60 shadow-[0_0_16px_rgba(168,85,247,0.25)]'
+                    : isCommitted ? 'border-yellow-400/50 shadow-[0_0_12px_rgba(250,204,21,0.15)]'
+                    : 'border-s-border'
+                  }`}>
                     {/* Header */}
                     <div className="flex items-center gap-2 p-4 pb-3">
-                      {isCommitted && <span className="text-yellow-400 text-xs" title="You have money on this">💰</span>}
+                      {isLiveCommitted && <span className="text-purple-400 text-xs" title="LIVE money committed">💎</span>}
+                      {isCommitted && !isLiveCommitted && <span className="text-yellow-400 text-xs" title="Practice money committed">💰</span>}
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-black uppercase tracking-wider flex-shrink-0 ${
+                        p.mode === 'sim'
+                          ? 'bg-s-blue/20 text-s-blue border border-s-blue/30'
+                          : 'bg-s-warn/20 text-s-warn border border-s-warn/30'
+                      }`}>{p.mode === 'sim' ? 'SIM' : 'LIVE'}</span>
                       <span className="text-sm font-semibold flex-1">{p.marketName || p.query}</span>
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-s-elevated text-s-muted uppercase">{p.venue || '—'}</span>
                       <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${cl.cls}`}>{cl.text}</span>
@@ -1344,7 +1450,7 @@ export default function App() {
                     {/* Review & Commit button → opens approval modal */}
                     {!ended && p.status !== 'resolved' && !isCommitted && (
                       <div className="mx-4 mb-3">
-                        <button onClick={() => openCommitModal(p)}
+                        <button data-synth-id={`commit-btn-${p.id}`} onClick={() => openCommitModal(p)}
                           className={`w-full px-4 py-3.5 rounded-lg text-sm font-bold transition-all hover:brightness-110 ${
                             wMode === 'sim'
                               ? 'bg-gradient-to-r from-s-green to-emerald-500 text-black'
@@ -1444,7 +1550,7 @@ export default function App() {
                 }),
                   ]
                 )}
-                {dedupedPreds.length === 0 && <p className="text-s-muted text-xs text-center py-8">No predictions yet. Ask NemoClaw or search above.</p>}
+                {dedupedPreds.length === 0 && <p className="text-s-muted text-xs text-center py-8">No predictions yet. Ask Opseeq or search above.</p>}
               </div>
             </div>
           )}
@@ -1468,7 +1574,8 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="bg-s-surface border border-s-border rounded-lg p-4">
+              <div data-synth-id="approvals-list" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('approvals-list')}`}>
+                {hlTooltip('approvals-list')}
                 <div className="flex items-center gap-3 mb-4">
                   <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Pending Approvals</h2>
                   <span className="text-[10px] text-s-muted">{pending.length} pending</span>
@@ -1519,20 +1626,24 @@ export default function App() {
                         <span className="font-mono">Token: {p.tokenId?.slice(0, 16)}...</span>
                       </div>
                       <div className="flex gap-2">
-                        <button onClick={() => {
+                        <button data-synth-id={`approval-execute-${a.id}`} onClick={() => {
                           api.approve(a.id).then(r => {
                             if ('orderResult' in (r as object)) {
                               triggerCelebration('fireworks')
-                              flash('🎆 Order executed! Check your positions on the Dashboard.')
+                              const rr = (r as { orderResult?: { balanceAfter?: { total?: string } } }).orderResult
+                              const balMsg = rr?.balanceAfter?.total ? ` Balance: $${f(rr.balanceAfter.total)}.` : ''
+                              flash(`🎆 Order executed! Check your positions on the Dashboard.${balMsg}`)
                               setTab('dashboard')
                             } else { flash('Approved') }
                             refresh()
                           }).catch(e => flash(`Error: ${e instanceof Error ? e.message : ''}`))
-                        }} className="px-4 py-2 bg-s-green text-black font-bold rounded text-xs hover:brightness-110">
+                        }} className={`relative px-4 py-2 bg-s-green text-black font-bold rounded text-xs hover:brightness-110 ${hl(`approval-execute-${a.id}`)}`}>
+                          {hlTooltip(`approval-execute-${a.id}`)}
                           {isLive ? '✓ Execute Real Order' : '✓ Approve'}
                         </button>
-                        <button onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }}
-                          className="px-4 py-2 bg-s-danger/20 text-s-danger border border-s-danger/30 rounded text-xs font-semibold">
+                        <button data-synth-id={`approval-reject-${a.id}`} onClick={() => { api.reject(a.id).then(refresh).catch(() => {}); flash('Rejected') }}
+                          className={`relative px-4 py-2 bg-s-danger/20 text-s-danger border border-s-danger/30 rounded text-xs font-semibold ${hl(`approval-reject-${a.id}`)}`}>
+                          {hlTooltip(`approval-reject-${a.id}`)}
                           ✗ Reject
                         </button>
                       </div>
@@ -1978,11 +2089,34 @@ export default function App() {
           )}
         </main>
 
-        {/* NemoClaw Chat Panel */}
-        {chatOpen && (
-          <div className="fixed right-0 top-12 bottom-0 w-[360px] bg-s-surface border-l border-s-border flex flex-col z-40">
+        {/* Opseeq Console Panel */}
+        {opseeqPanel && (
+          <div className="fixed top-12 bottom-0 w-[560px] bg-s-surface border-l border-s-border z-30 flex flex-col" style={{ right: chatOpen ? '360px' : '0px' }}>
             <div className="flex items-center justify-between px-3 h-10 border-b border-s-border">
-              <span className="text-xs font-bold text-s-accent tracking-wider">NEMOCLAW</span>
+              <span className="text-xs font-bold text-s-blue tracking-wider">OPSEEQ GATEWAY</span>
+              <div className="flex items-center gap-2">
+                <span className={`text-[10px] ${opseeqAvailable ? 'text-s-green' : 'text-s-warn'}`}>{opseeqAvailable ? 'ONLINE' : 'OFFLINE'}</span>
+                <button onClick={() => setOpseeqPanel(false)} className="text-s-muted hover:text-s-text text-xs">✕</button>
+              </div>
+            </div>
+            <div className="flex-1 bg-black/20">
+              <iframe title="Opseeq Console" src={opseeqUrl} className="w-full h-full border-0" />
+            </div>
+          </div>
+        )}
+        {chatOpen && (
+          <div data-synth-id="chat-panel" className={`fixed right-0 top-12 bottom-0 w-[360px] bg-s-surface border-l border-s-border flex flex-col z-40 ${hl('chat-panel')}`}>
+            {hlTooltip('chat-panel')}
+            <div className="flex items-center justify-between px-3 h-10 border-b border-s-border">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-s-accent tracking-wider">OPSEEQ</span>
+                <span className={`w-1.5 h-1.5 rounded-full ${opseeqAvailable ? 'bg-s-green' : 'bg-s-danger'}`} />
+                {lastInference && (
+                  <span className="text-[9px] text-s-muted font-mono truncate max-w-[120px]" title={`${lastInference.model} via ${lastInference.route}`}>
+                    {lastInference.model.split('/').pop()} ({lastInference.route})
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <button onClick={() => setAutoMode(!autoMode)}
                   className={`text-[10px] px-2 py-0.5 rounded font-semibold transition-all ${autoMode ? 'bg-s-accent text-black animate-pulse' : 'bg-s-elevated text-s-muted hover:text-s-text'}`}>
@@ -1993,14 +2127,28 @@ export default function App() {
             </div>
             {/* Thinking stages display */}
             {thinkLog.length > 0 && (
-              <div className="px-3 py-2 border-b border-s-border/50 bg-s-elevated/30">
-                <div className="text-[9px] text-s-muted uppercase tracking-wider mb-1.5">Reasoning stages</div>
-                <div className="flex flex-wrap gap-1">
+              <div className="border-b border-s-border/50 bg-s-elevated/30">
+                <div className="flex items-center gap-2 px-3 py-1.5">
+                  <div className="text-[9px] text-s-muted uppercase tracking-wider">Reasoning</div>
+                  <div className="flex flex-wrap gap-1">
+                    {thinkLog.map((t, i) => (
+                      <div key={i} title={t.thought}
+                        className={`text-[9px] px-1 py-0.5 rounded border flex items-center gap-0.5 cursor-help ${STAGE_COLORS[t.stage] || 'text-s-muted'} border-current/30 bg-current/5`}>
+                        <span>{STAGE_ICONS[t.stage] || '◦'}</span>
+                        <span>{t.stage}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {chatLoading && <span className="text-[9px] text-s-accent animate-pulse ml-auto">working...</span>}
+                </div>
+                <div className="max-h-[140px] overflow-y-auto px-3 pb-2 space-y-1">
                   {thinkLog.map((t, i) => (
-                    <div key={i} title={t.thought}
-                      className={`text-[10px] px-1.5 py-0.5 rounded border flex items-center gap-1 cursor-help ${STAGE_COLORS[t.stage] || 'text-s-muted'} border-current/30 bg-current/5`}>
-                      <span>{STAGE_ICONS[t.stage] || '◦'}</span>
-                      <span>{t.stage}</span>
+                    <div key={`trace-${i}`} className="rounded border border-s-border/40 bg-s-panel/40 px-2 py-1">
+                      <div className="flex items-center justify-between gap-2 text-[8px] uppercase tracking-wider">
+                        <span className={`${STAGE_COLORS[t.stage] || 'text-s-muted'} font-bold`}>{t.stage}</span>
+                        <span className="text-s-muted font-mono">{ts(t.enteredAt)}</span>
+                      </div>
+                      <div className="mt-0.5 text-[10px] text-s-muted leading-snug">{t.thought}</div>
                     </div>
                   ))}
                 </div>
@@ -2010,7 +2158,7 @@ export default function App() {
               {chatMsgs.length === 0 && (
                 <div className="py-4">
                   <div className="text-xs text-s-muted border-l-2 border-s-accent pl-3 mb-4">
-                    <p className="text-s-text font-semibold mb-1">Welcome to NemoClaw</p>
+                    <p className="text-s-text font-semibold mb-1">Welcome to Opseeq</p>
                     <p>I find the best near-term prediction markets, analyze them with AI, and walk you through placing a prediction.</p>
                     <p className="mt-1">Balance: <span className="font-mono text-s-accent">${f(bal?.total || '0')}</span> | Markets tracked: <span className="font-mono text-s-accent">{mkts.length}</span></p>
                   </div>
@@ -2019,6 +2167,8 @@ export default function App() {
                     {[
                       ['Find me the best crypto bet right now', 'BTC, ETH, SOL 15-min markets + commit'],
                       ['Find me the best bet and commit $5', 'Full OODA loop → auto-commit $5'],
+                      ['YES - execute the queued order', 'Approves the currently queued live order'],
+                      ['NO - cancel the queued order', 'Rejects the currently queued live order'],
                       ['What can I afford with $' + f(bal?.total || '0') + '?', 'Shows affordable options based on balance'],
                       ['Clean up my stale predictions', 'Remove ended + distant uncommitted predictions'],
                       ['Show my positions and P&L', 'Lists all committed bets and performance'],
@@ -2039,20 +2189,31 @@ export default function App() {
                 </div>
               ))}
               {chatLoading && (
-                <div className="text-xs text-s-accent border-l-2 border-yellow-400 pl-3 py-2 animate-pulse">
-                  NemoClaw is thinking...
+                <div className="text-xs border-l-2 border-yellow-400 pl-3 py-2 space-y-1">
+                  <div className="text-s-accent animate-pulse">Opseeq is working...</div>
+                  {thinkLog.length > 0 && (
+                    <div className="text-[10px] text-s-muted">
+                      Stage: <span className="text-s-text font-semibold">{thinkLog[thinkLog.length - 1].stage}</span>
+                      {' '}&mdash; {thinkLog.length} step{thinkLog.length !== 1 ? 's' : ''} so far
+                    </div>
+                  )}
+                  {opseeqAvailable && <div className="text-[9px] text-s-muted">via Opseeq gateway</div>}
                 </div>
               )}
               <div ref={chatEndRef} />
             </div>
-            <div className="p-3 border-t border-s-border">
+            <div data-synth-id="chat-input-wrap" className={`relative p-3 border-t border-s-border ${hl('chat-input-wrap')}`}>
+              {hlTooltip('chat-input-wrap')}
               <div className="flex gap-2">
-                <input className="flex-1 bg-s-bg border border-s-border rounded px-2.5 py-2 text-xs text-s-text outline-none focus:border-s-accent"
-                  placeholder="Ask NemoClaw..." value={chatInput} onChange={e => setChatInput(e.target.value)}
+                <input data-synth-id="chat-input" className={`flex-1 bg-s-bg border border-s-border rounded px-2.5 py-2 text-xs text-s-text outline-none focus:border-s-accent ${hl('chat-input')}`}
+                  placeholder="Ask Opseeq..." value={chatInput} onChange={e => setChatInput(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(chatInput) } }}
                   disabled={chatLoading} />
-                <button onClick={() => sendChat(chatInput)} disabled={chatLoading || !chatInput.trim()}
-                  className="px-3 py-2 bg-s-accent text-black font-bold rounded text-xs disabled:opacity-50">→</button>
+                <button data-synth-id="chat-send" onClick={() => sendChat(chatInput)} disabled={chatLoading || !chatInput.trim()}
+                  className={`relative px-3 py-2 bg-s-accent text-black font-bold rounded text-xs disabled:opacity-50 ${hl('chat-send')}`}>
+                  {hlTooltip('chat-send')}
+                  →
+                </button>
               </div>
             </div>
           </div>

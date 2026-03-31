@@ -83,7 +83,7 @@ if _settings.openai_api_key:
 _mode = "sim" if _settings.simulation_mode else "live"
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
-mcp = FastMCP(name="nemoclaw")
+mcp = FastMCP(name="opseeq")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

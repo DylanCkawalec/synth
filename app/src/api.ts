@@ -62,6 +62,12 @@ export const getMintStatus = (walletId: string) =>
 export const mintSimFunds = (walletId: string, amount: number) =>
   api<MintResult>(`/wallet/${walletId}/sim/mint`, { method: 'POST', body: JSON.stringify({ amount }) })
 
-export async function chat(messages: Array<{ role: string; content: string }>): Promise<{ reply: string; commands: AgentCommand[] }> {
-  return api('/chat', { method: 'POST', body: JSON.stringify({ messages }) })
+export async function chat(messages: Array<{ role: string; content: string }>, mode?: 'real' | 'sim'): Promise<{ reply: string; commands: AgentCommand[] }> {
+  return api('/chat', { method: 'POST', body: JSON.stringify({ messages, mode }) })
 }
+
+export const getOpseeqStatus = () =>
+  api<{ available: boolean; url: string; lastProbeAt: string | null; status: Record<string, unknown> | null }>('/opseeq/status')
+
+export const launchOpseeq = () =>
+  api<{ launching?: boolean; already?: boolean; ready?: boolean; url: string }>('/opseeq/launch', { method: 'POST' })
