@@ -10,7 +10,7 @@ services:
     build:
       context: ${OPSEEQ_REPO:-../opseeq}
       dockerfile: Dockerfile.service
-    image: opseeq:v5
+    image: opseeq:v6.0
     container_name: opseeq
     ports:
       - "9090:9090"

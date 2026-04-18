@@ -40,6 +40,8 @@ const REQUIRE_APPROVAL = process.env.REQUIRE_APPROVAL !== 'false'
 const AVAILABLE_MODELS = ['gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini', 'o3', 'gpt-4.5-preview'] as const
 const OPSEEQ_FALLBACK_MODELS = ['nvidia/llama-3.3-nemotron-super-49b-v1', 'nvidia/nemotron-3-super-120b-a12b'] as const
 let horizonDays = parseInt(process.env.MARKET_HORIZON_DAYS || '7')
+/** Parallel NIM+GPT swarm + news (slow). Default off — single-model prediction is much faster. Set OPSEEQ_SWARM=true to enable. */
+const OPSEEQ_SWARM = process.env.OPSEEQ_SWARM === 'true'
 
 const RISK = {
   maxPositionUsdc:    parseFloat(process.env.MAX_POSITION_USDC || '1000'),
@@ -443,7 +445,7 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
     const [usedClient, usedModel, usedJsonMode] = clients[attempt]
     try {
       const resp = await usedClient.chat.completions.create({
-        model: usedModel, temperature: 0.3, max_tokens: 2000,
+        model: usedModel, temperature: 0.3, max_tokens: 1400,
         ...(usedJsonMode ? { response_format: { type: 'json_object' } } : {}),
         messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
       })
@@ -582,7 +584,7 @@ Pick the single best market matching the query. Analyze it deeply. Always provid
   const runCall = async (model: string, useJson: boolean): Promise<Record<string, unknown> | null> => {
     try {
       const resp = await client.chat.completions.create({
-        model, temperature: 0.3, max_tokens: 2000,
+        model, temperature: 0.3, max_tokens: 1400,
         ...(useJson ? { response_format: { type: 'json_object' as const } } : {}),
         messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
       })
@@ -678,7 +680,7 @@ Pick the best market. Always provide a YES or NO lean with reasoning.`
     const usedModel = attempt === 0 ? model : getEffectiveAgentModel()
     const usedJsonMode = attempt === 0 ? useJsonMode : true
     const resp = await client.chat.completions.create({
-      model: usedModel, temperature: 0.3, max_tokens: 2000,
+      model: usedModel, temperature: 0.3, max_tokens: 1400,
       ...(usedJsonMode ? { response_format: { type: 'json_object' } } : {}),
       messages: [{ role: 'system', content: PRED_SYSTEM }, { role: 'user', content: userMsg }],
     })
@@ -918,6 +920,7 @@ These mean "start over with a new search":
 
 ## IMPORTANT BEHAVIORAL RULES
 
+0. NEVER write think({...}), fetch_markets(...), or any pseudo-code tool calls in your visible reply — only natural language. The UI already shows reasoning separately.
 1. NEVER end a message without a clear next-step prompt for the user
 2. NEVER present data without telling the user what to do with it
 3. When the user confirms, ACT IMMEDIATELY — call place_order in the same turn, do not ask again
@@ -925,7 +928,7 @@ These mean "start over with a new search":
 5. Keep messages concise — max 100 words for recommendations, max 50 words for confirmations
 6. Always state the mode (SIM/LIVE) in your recommendation
 7. If balance < $1: say so clearly and suggest minting (SIM) or depositing (LIVE)
-8. Use think() at every stage transition — the user sees your reasoning live
+8. Use think() at every stage transition — the user sees your reasoning live (via structured events — NEVER paste think(...) or tool syntax as plain text in your message)
 9. Use highlight() to guide the user's eyes to the right UI element
 10. Finish the current trade before suggesting a new one
 11. CRITICAL: Your token_id and prediction_id come from generate_prediction output. Always use them.
@@ -1064,18 +1067,20 @@ async function executeTool(
       return synth(`/wallet/${wid}/positions`)
     }
     case 'generate_prediction': {
-      ensureThinkStage(commands, 'analyze', 'Running swarm analysis: parallel NIM + GPT-4o with news context.')
-      ensureThinkStage(commands, 'decide', 'Merging swarm results and selecting the optimal position.')
+      const marketName = String(args.market_name || '').trim()
+      if (!marketName) return { error: 'market_name required — pass the exact market title to analyze' }
+      ensureThinkStage(commands, 'analyze', OPSEEQ_SWARM ? 'Running swarm analysis (NIM + GPT + news).' : 'Running fast single-pass prediction model.')
+      ensureThinkStage(commands, 'decide', 'Locking thesis, lean, and size for this market.')
       const events = await synth(
-        `/markets/search/${encodeURIComponent(String(args.market_name))}?limit=10`,
+        `/markets/search/${encodeURIComponent(marketName)}?limit=10`,
       ) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
       const flat = events.flatMap(ev =>
         ev.markets.map(m => ({ ...m, event_title: ev.event.title, venue: ev.venue, ends_at: m.ends_at || ev.event.ends_at })),
       )
-      const useSwarm = opseeqAvailable && opseeqConsecutiveFailures < OPSEEQ_CIRCUIT_THRESHOLD
+      const useSwarm = OPSEEQ_SWARM && opseeqAvailable && opseeqConsecutiveFailures < OPSEEQ_CIRCUIT_THRESHOLD
       const pred = useSwarm
-        ? await generateSwarmPrediction(String(args.market_name), flat, defaultWalletId || undefined, effectiveMode)
-        : await generatePrediction(String(args.market_name), flat, defaultWalletId || undefined, undefined, effectiveMode)
+        ? await generateSwarmPrediction(marketName, flat, defaultWalletId || undefined, effectiveMode)
+        : await generatePrediction(marketName, flat, defaultWalletId || undefined, undefined, effectiveMode)
       commands.push({ type: 'tool', payload: { name: 'generate_prediction', prediction: pred.id, swarm: useSwarm } })
       return {
         id: pred.id, thesis: pred.thesis, confidence: pred.confidence,
@@ -1259,7 +1264,7 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
   let resp: Awaited<ReturnType<typeof client.chat.completions.create>>
   try {
     resp = await client.chat.completions.create({
-      model, temperature: 0.3, max_tokens: 2000,
+      model, temperature: 0.3, max_tokens: 1600,
       tools: AGENT_TOOLS,
       messages: [{ role: 'system', content: systemPrompt }, ...messages],
     })
@@ -1271,7 +1276,7 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
     model = 'gpt-4o'
     emitTrace({ traceId: agentTraceId, stage: 'agent_fallback', action: 'opseeq_to_direct', mode: (requestMode || (SIM_MODE ? 'sim' : 'real')) === 'sim' ? 'simulation' : 'live', route: 'fallback', model, success: true })
     resp = await directOai.chat.completions.create({
-      model, temperature: 0.3, max_tokens: 2000,
+      model, temperature: 0.3, max_tokens: 1600,
       tools: AGENT_TOOLS,
       messages: [{ role: 'system', content: systemPrompt }, ...messages],
     })
@@ -1291,9 +1296,9 @@ async function runAgentTurn(messages: OpenAI.Chat.Completions.ChatCompletionMess
       out.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
     }
 
-    for (let round = 0; round < 4; round++) {
+    for (let round = 0; round < 2; round++) {
       const followUp = await client.chat.completions.create({
-        model, temperature: 0.3, max_tokens: 2000,
+        model, temperature: 0.3, max_tokens: 1600,
         tools: AGENT_TOOLS,
         messages: [{ role: 'system', content: systemPrompt }, ...out],
       })
@@ -1569,7 +1574,7 @@ app.get('/api/health', (_req, res) => {
     aiAvailable: !!openai, ai_engine_available: !!openai,
     predictions: predCount, predictions_available: predCount > 0,
     pendingApprovals, defaultWallet: defaultWalletId, authenticated: !!SECRET_KEY,
-    opseeq: { available: opseeqAvailable, url: OPSEEQ_URL, circuitOpen: opseeqConsecutiveFailures >= OPSEEQ_CIRCUIT_THRESHOLD, failures: opseeqConsecutiveFailures },
+    opseeq: { available: opseeqAvailable, url: OPSEEQ_URL, circuitOpen: opseeqConsecutiveFailures >= OPSEEQ_CIRCUIT_THRESHOLD, failures: opseeqConsecutiveFailures, swarmPredictions: OPSEEQ_SWARM },
     runtime: { route: currentRoute(), predictionModel: getEffectivePredictionModel(activeModel), agentModel: getEffectiveAgentModel(), recentTraces: recentTraces.length },
   })
 })
@@ -1848,7 +1853,8 @@ app.get('/api/markets', async (req, res) => {
 // Dual-mode prediction pipeline
 app.post('/api/predict', async (req, res) => {
   try {
-    const { query, walletId, mode } = req.body
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : ''
+    const { walletId, mode } = req.body
     if (!query) return res.status(400).json({ error: 'query required' })
     const effectiveMode: 'real' | 'sim' | undefined = mode === 'real' ? 'real' : mode === 'sim' ? 'sim' : undefined
     const events = await synth(`/markets/search/${encodeURIComponent(query)}?limit=10`) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
@@ -1864,7 +1870,8 @@ app.post('/api/predict', async (req, res) => {
 // Legacy generate endpoint (convenience alias)
 app.post('/api/predictions/generate', async (req, res) => {
   try {
-    const { query, walletId, mode: reqMode } = req.body
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : ''
+    const { walletId, mode: reqMode } = req.body
     if (!query) return res.status(400).json({ error: 'query required' })
     const effectiveMode: 'real' | 'sim' = reqMode === 'real' ? 'real' : reqMode === 'sim' ? 'sim' : (SIM_MODE ? 'sim' : 'real')
     const events = await synth(`/markets/search/${encodeURIComponent(query)}?limit=10`) as Array<{ event: { title: string; ends_at?: string }; venue?: string; markets: Array<Record<string, unknown>> }>
@@ -2126,6 +2133,18 @@ app.post('/api/kelly', (req, res) => {
   } catch (e) { res.status(400).json({ error: String(e) }) }
 })
 
+/** Strip accidental tool-syntax echoes from model text (bad UX if shown raw). */
+function sanitizeChatReply(raw: string): string {
+  let s = raw
+    .replace(/\bthink\s*\(\s*\{[\s\S]*?\}\s*\)/gi, '')
+    .replace(/\bthink\s*\(\s*[^)]*\)/gi, '')
+    .replace(/\bfetch_[a-z_]+\s*\([^)]*\)/gi, '')
+    .replace(/\bgenerate_prediction\s*\([^)]*\)/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return s
+}
+
 // Opseeq Chat
 app.post('/api/chat', async (req, res) => {
   try {
@@ -2148,6 +2167,7 @@ app.post('/api/chat', async (req, res) => {
         }
       }
     }
+    content = sanitizeChatReply(content || '')
     res.json({
       reply: content || 'Analysis complete. Check the highlighted panels.',
       commands: result.commands,

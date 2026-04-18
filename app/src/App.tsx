@@ -4,6 +4,8 @@ import type { Tab, Prediction, ScoredMarket, Balance, Position, PNL, HealthStatu
 import { SUPPORTED_CHAINS, CHAIN_IDS, SUPPORTED_TOKENS } from './types.ts'
 import * as api from './api.ts'
 import { scoreMarkets } from './scoring.ts'
+import { PretextBlock, plainFromAssistantMarkdown, PRETEXT_FONT_SMALL, PRETEXT_FONT_TINY } from './pretext.tsx'
+import { OpseeqLoadingPulse, OpseeqThinkStages } from './OpseeqThinkUI.tsx'
 
 // ── Celebration particle system ───────────────────────────────────
 type CelebType = 'fireworks' | 'confetti' | 'money'
@@ -56,11 +58,6 @@ const cc = (c: number) => c >= .75 ? 'bg-s-green' : c >= .5 ? 'bg-s-accent' : c 
 const uIcons: Record<string, string> = { critical: '🔴', soon: '🟡', normal: '🟢', distant: '⚪', ended: '⚫' }
 const pct = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}%` }
 const cost = (price: string | number) => { const v = typeof price === 'string' ? parseFloat(price) : price; return isNaN(v) ? '—' : `${Math.round(v * 100)}¢` }
-const ts = (iso?: string) => {
-  if (!iso) return ''
-  return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
-}
-
 function truncAddr(addr: string, n = 6) { return addr ? `${addr.slice(0, n)}...${addr.slice(-4)}` : '' }
 function isValidEvmAddress(addr: string) { return /^0x[a-fA-F0-9]{40}$/.test(addr) }
 function isValidSolAddress(addr: string) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr) }
@@ -178,10 +175,6 @@ function Sparkline({ points, width = 120, height = 32, color = '#00ffb4' }: { po
     </svg>
   )
 }
-
-// Stage icons for Opseeq thinking
-const STAGE_ICONS: Record<string, string> = { observe: '👁', orient: '🧭', research: '🔍', analyze: '📊', decide: '⚡', act: '🎯' }
-const STAGE_COLORS: Record<string, string> = { observe: 'text-s-blue', orient: 'text-s-accent', research: 'text-purple-400', analyze: 'text-yellow-400', decide: 'text-s-warn', act: 'text-s-green' }
 
 // ── Main App ──────────────────────────────────────────────────────
 export default function App() {
@@ -363,9 +356,14 @@ export default function App() {
   }, [])
 
   const predict = async (query: string, navigate = true) => {
+    const q = String(query || '').trim()
+    if (!q) {
+      flash('Enter a search query (e.g. BTC, election, sports)')
+      return null
+    }
     setLoading(true)
     try {
-      const p = await api.generatePrediction(query, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
+      const p = await api.generatePrediction(q, wid || undefined, wMode === 'sim' ? 'sim' : 'real')
       setPreds(prev => upsertPredictionList(prev, p))
       if (navigate) setTab('predictions')
       flash('Prediction generated')
@@ -770,7 +768,7 @@ export default function App() {
   const rightDockPx = (chatOpen ? 360 : 0) + (opseeqPanel ? 560 : 0)
 
   return (
-    <div className="min-h-screen flex flex-col font-sans text-[13px]">
+    <div className="synth-desk min-h-screen flex flex-col font-sans text-[13px]">
       {celebration && <Celebration type={celebration} onDone={() => setCelebration(null)} />}
 
       {/* ── COMMIT APPROVAL MODAL ── */}
@@ -948,7 +946,7 @@ export default function App() {
         <div className="flex items-center gap-3">
           <h1 className="text-base font-bold tracking-[3px] text-s-accent">SYNTH</h1>
         </div>
-        <nav className="flex gap-0.5">
+        <nav className="sfx-nav flex gap-0.5">
           {(['dashboard','markets','predictions','approvals','audit','settings'] as Tab[]).map(t => (
             <button key={t} onClick={() => { setTab(t); if (t === 'audit') api.getAudit().then(setAudit).catch(() => {}) }}
               className={`px-3 py-1.5 rounded text-xs transition-all duration-200 ${tab === t ? 'text-s-accent bg-s-panel border-b-2 border-s-accent' : 'text-s-muted hover:text-s-text hover:bg-s-panel/50'}`}>
@@ -1035,7 +1033,7 @@ export default function App() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Main content */}
-        <main className="flex-1 p-3 overflow-y-auto transition-all duration-300 min-h-0" style={{ marginRight: rightDockPx > 0 ? `${rightDockPx}px` : undefined }}>
+        <main className="sfx-main flex-1 p-3 overflow-y-auto transition-all duration-300 min-h-0" style={{ marginRight: rightDockPx > 0 ? `${rightDockPx}px` : undefined }}>
           {toast && <div className="fixed top-14 right-5 bg-s-panel border border-s-accent text-s-text px-4 py-2.5 rounded text-xs z-50 animate-[slideIn_0.2s_ease-out]">{toast}</div>}
 
           {/* ── DASHBOARD ── */}
@@ -1053,10 +1051,10 @@ export default function App() {
               .sort((a, b) => (a.minutesLeft ?? 99999) - (b.minutesLeft ?? 99999))
               .slice(0, 8)
             return (
-            <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-3 sfx-scene">
 
               {/* ── METRIC ROW — compact single-line KPI strip ── */}
-              <div className="flex items-center gap-px bg-s-border rounded-xl overflow-hidden border border-s-border">
+              <div className="sfx-kpi-strip flex items-center gap-px bg-s-border rounded-xl overflow-hidden border border-s-border">
                 {[
                   { label: 'Live', value: `$${f(liveBal$)}`, sub: `${liveOpenPos.length} pos`, color: 'text-s-warn', dot: 'bg-s-warn' },
                   { label: 'Practice', value: `$${f(simBal$)}`, sub: `${simOpenPos.length} bets`, color: 'text-s-blue', dot: 'bg-s-blue' },
@@ -1078,7 +1076,7 @@ export default function App() {
               <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-3">
 
                 {/* ─── LEFT: MY POSITIONS ─── */}
-                <div className="bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col">
+                <div className="sfx-island bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col">
                   {/* Island header */}
                   <div className="flex items-center gap-3 px-3 py-2.5 border-b border-s-border flex-shrink-0">
                     <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">Positions</span>
@@ -1230,7 +1228,7 @@ export default function App() {
                 <div className="flex flex-col gap-3 min-w-0">
 
                   {/* Closing Soon feed */}
-                  <div data-synth-id="closing-soon" className={`bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col flex-1 ${hl('closing-soon')}`}>
+                  <div data-synth-id="closing-soon" className={`sfx-island bg-s-surface border border-s-border rounded-xl overflow-hidden flex flex-col flex-1 ${hl('closing-soon')}`}>
                     {hlTooltip('closing-soon')}
                     <div className="px-3 py-2.5 border-b border-s-border flex-shrink-0 flex items-center justify-between">
                       <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">Closing Soon</span>
@@ -1257,7 +1255,7 @@ export default function App() {
 
                   {/* Crypto quick bets — compact list */}
                   {cryptoMkts.length > 0 && (
-                    <div data-synth-id="crypto-bets" className={`bg-s-surface border border-s-border rounded-xl overflow-hidden flex-shrink-0 ${hl('crypto-bets')}`}>
+                    <div data-synth-id="crypto-bets" className={`sfx-island bg-s-surface border border-s-border rounded-xl overflow-hidden flex-shrink-0 ${hl('crypto-bets')}`}>
                       {hlTooltip('crypto-bets')}
                       <div className="px-3 py-2 border-b border-s-border flex items-center justify-between">
                         <span className="text-[9px] font-black uppercase tracking-widest text-s-muted">⚡ Crypto</span>
@@ -1297,7 +1295,7 @@ export default function App() {
 
           {/* ── MARKETS ── */}
           {tab === 'markets' && (
-            <div data-synth-id="market-table" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('market-table')}`}>
+            <div data-synth-id="market-table" className={`sfx-surface sfx-table-wrap relative bg-s-surface border border-s-border rounded-xl p-4 ${hl('market-table')}`}>
               {hlTooltip('market-table')}
               <div className="flex items-center justify-between mb-3">
                 <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Market Discovery</h2>
@@ -1332,7 +1330,7 @@ export default function App() {
 
           {/* ── MY PREDICTIONS ── */}
           {tab === 'predictions' && (
-            <div data-synth-id="prediction-list" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('prediction-list')}`}>
+            <div data-synth-id="prediction-list" className={`sfx-surface relative bg-s-surface border border-s-border rounded-xl p-4 ${hl('prediction-list')}`}>
               {hlTooltip('prediction-list')}
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-3">
@@ -1411,11 +1409,13 @@ export default function App() {
                     {/* AI Lean + Recommendation */}
                     <div className="mx-4 mb-3 p-3 rounded-lg border border-s-accent/30 bg-s-accent/5">
                       {p.lean && (
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className={`text-sm font-black px-2 py-0.5 rounded ${p.lean === 'YES' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>
+                        <div className="flex items-start gap-2 mb-2">
+                          <span className={`text-sm font-black px-2 py-0.5 rounded flex-shrink-0 ${p.lean === 'YES' ? 'bg-s-green/20 text-s-green' : 'bg-s-danger/20 text-s-danger'}`}>
                             {p.lean}
                           </span>
-                          <span className="text-xs text-s-muted flex-1">{p.leanReason || p.thesis}</span>
+                          <PretextBlock text={p.leanReason || p.thesis || ' '} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-xs text-s-muted flex-1 min-w-0">
+                            <span className="text-xs text-s-muted block">{p.leanReason || p.thesis}</span>
+                          </PretextBlock>
                         </div>
                       )}
                       <div className="text-xs font-semibold">
@@ -1507,11 +1507,31 @@ export default function App() {
                               )}
                             </div>
                           )}
-                          <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Thesis</strong><p className="text-s-muted mt-0.5">{p.thesis}</p></div>
-                          <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Rationale</strong><p className="text-s-muted mt-0.5">{p.rationale}</p></div>
+                          <div>
+                            <strong className="text-[10px] uppercase tracking-wide text-s-text">Thesis</strong>
+                            <PretextBlock text={p.thesis || ' '} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-s-muted mt-0.5">
+                              <p className="text-s-muted mt-0.5">{p.thesis}</p>
+                            </PretextBlock>
+                          </div>
+                          <div>
+                            <strong className="text-[10px] uppercase tracking-wide text-s-text">Rationale</strong>
+                            <PretextBlock text={p.rationale || ' '} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-s-muted mt-0.5">
+                              <p className="text-s-muted mt-0.5">{p.rationale}</p>
+                            </PretextBlock>
+                          </div>
                           <div className="grid grid-cols-2 gap-3">
-                            <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Invalidation</strong><p className="text-s-muted mt-0.5">{p.invalidation}</p></div>
-                            <div><strong className="text-[10px] uppercase tracking-wide text-s-text">Risk</strong><p className="text-s-muted mt-0.5">{p.riskNote}</p></div>
+                            <div>
+                              <strong className="text-[10px] uppercase tracking-wide text-s-text">Invalidation</strong>
+                              <PretextBlock text={p.invalidation || ' '} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-s-muted mt-0.5">
+                                <p className="text-s-muted mt-0.5">{p.invalidation}</p>
+                              </PretextBlock>
+                            </div>
+                            <div>
+                              <strong className="text-[10px] uppercase tracking-wide text-s-text">Risk</strong>
+                              <PretextBlock text={p.riskNote || ' '} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-s-muted mt-0.5">
+                                <p className="text-s-muted mt-0.5">{p.riskNote}</p>
+                              </PretextBlock>
+                            </div>
                           </div>
                           {p.model && <div className="text-[10px] text-s-muted">Model: {p.model} | Token: <span className="font-mono">{p.tokenId?.slice(0, 16)}...</span></div>}
                         </div>
@@ -1541,7 +1561,9 @@ export default function App() {
                       <div className="px-4 pb-3">
                         <div className="p-2 rounded-lg bg-s-elevated/50 border border-s-border/50">
                           <div className="text-[10px] uppercase tracking-wide text-s-muted mb-1">Auto Reflection</div>
-                          <div className="text-[11px] text-s-muted leading-relaxed">{p.reflection}</div>
+                          <PretextBlock text={p.reflection} font={PRETEXT_FONT_TINY} lineHeight={15} className="text-[11px] text-s-muted leading-relaxed">
+                            <div className="text-[11px] text-s-muted leading-relaxed">{p.reflection}</div>
+                          </PretextBlock>
                         </div>
                       </div>
                     )}
@@ -1557,24 +1579,32 @@ export default function App() {
 
           {/* ── APPROVALS ── */}
           {tab === 'approvals' && (
-            <div className="space-y-4">
+            <div className="space-y-4 sfx-scene">
               {/* Explainer banner */}
-              <div className="bg-s-surface border border-s-accent/20 rounded-lg p-4">
+              <div className="sfx-surface bg-s-surface border border-s-accent/20 rounded-xl p-4">
                 <div className="flex items-start gap-3">
                   <span className="text-lg">🔐</span>
                   <div>
                     <h3 className="text-xs font-bold text-s-text mb-1">How Approvals Work</h3>
                     <div className="text-[10px] text-s-muted space-y-1">
-                      <p><strong className="text-s-text">Predictions</strong> = AI-generated trade ideas. Free to create, no money moves.</p>
-                      <p><strong className="text-s-text">Approvals</strong> = When you click "Commit" in <strong className="text-s-warn">LIVE mode</strong>, the order queues here for your final confirmation before real money executes.</p>
-                      <p><strong className="text-s-text">Positions</strong> = Orders that have been filled. Visible on the Dashboard under "My Positions".</p>
-                      <p className="text-s-accent">In <strong>Practice mode</strong>, orders execute instantly (no approval needed).</p>
+                      <PretextBlock text="Predictions = AI-generated trade ideas. Free to create, no money moves." font={PRETEXT_FONT_TINY} lineHeight={15}>
+                        <p><strong className="text-s-text">Predictions</strong> = AI-generated trade ideas. Free to create, no money moves.</p>
+                      </PretextBlock>
+                      <PretextBlock text='Approvals = When you click "Commit" in LIVE mode, the order queues here for your final confirmation before real money executes.' font={PRETEXT_FONT_TINY} lineHeight={15}>
+                        <p><strong className="text-s-text">Approvals</strong> = When you click &quot;Commit&quot; in <strong className="text-s-warn">LIVE mode</strong>, the order queues here for your final confirmation before real money executes.</p>
+                      </PretextBlock>
+                      <PretextBlock text='Positions = Orders that have been filled. Visible on the Dashboard under "My Positions".' font={PRETEXT_FONT_TINY} lineHeight={15}>
+                        <p><strong className="text-s-text">Positions</strong> = Orders that have been filled. Visible on the Dashboard under &quot;My Positions&quot;.</p>
+                      </PretextBlock>
+                      <PretextBlock text="In Practice mode, orders execute instantly (no approval needed)." font={PRETEXT_FONT_TINY} lineHeight={15}>
+                        <p className="text-s-accent">In <strong>Practice mode</strong>, orders execute instantly (no approval needed).</p>
+                      </PretextBlock>
                     </div>
                   </div>
                 </div>
               </div>
 
-              <div data-synth-id="approvals-list" className={`relative bg-s-surface border border-s-border rounded-lg p-4 ${hl('approvals-list')}`}>
+              <div data-synth-id="approvals-list" className={`sfx-surface sfx-table-wrap relative bg-s-surface border border-s-border rounded-xl p-4 ${hl('approvals-list')}`}>
                 {hlTooltip('approvals-list')}
                 <div className="flex items-center gap-3 mb-4">
                   <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Pending Approvals</h2>
@@ -1656,7 +1686,7 @@ export default function App() {
 
           {/* ── AUDIT ── */}
           {tab === 'audit' && (
-            <div className="bg-s-surface border border-s-border rounded-lg p-4">
+            <div className="sfx-surface sfx-table-wrap bg-s-surface border border-s-border rounded-xl p-4">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider">Audit Log</h2>
                 <button className="px-2 py-1 text-xs bg-s-elevated text-s-muted rounded hover:text-s-text" onClick={() => api.getAudit().then(setAudit).catch(() => {})}>Refresh</button>
@@ -1676,9 +1706,9 @@ export default function App() {
 
           {/* ── SETTINGS ── */}
           {tab === 'settings' && (
-            <div className="space-y-4">
+            <div className="space-y-4 sfx-scene">
               {/* Settings sub-tabs */}
-              <div className="flex gap-1 bg-s-surface border border-s-border rounded-lg p-1">
+              <div className="sfx-settings-tabs flex gap-1 bg-s-surface border border-s-border rounded-xl p-1">
                 {(['wallet', 'deposit', 'withdraw', 'config'] as const).map(st => (
                   <button key={st} onClick={() => setSettingsTab(st)}
                     className={`flex-1 px-3 py-2 rounded text-xs font-semibold transition-all ${settingsTab === st ? 'bg-s-accent text-black' : 'text-s-muted hover:text-s-text hover:bg-s-panel'}`}>
@@ -1698,7 +1728,7 @@ export default function App() {
               {/* Wallet */}
               {settingsTab === 'wallet' && (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                  <div className="bg-s-surface border border-s-border rounded-lg p-4">
+                  <div className="sfx-surface bg-s-surface border border-s-border rounded-xl p-4">
                     <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">Synthesis Wallets</h2>
                     {wallets.length > 0 ? wallets.map(w => (
                       <div key={w.wallet_id} onClick={() => setWid(w.wallet_id)}
@@ -1724,9 +1754,11 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="bg-s-surface border border-s-border rounded-lg p-4">
+                  <div className="sfx-surface bg-s-surface border border-s-border rounded-xl p-4">
                     <h2 className="text-xs font-semibold text-s-muted uppercase tracking-wider mb-3">External Wallet</h2>
-                    <p className="text-[10px] text-s-muted mb-3">For deposits and withdrawals only. Your Synthesis wallet handles trading.</p>
+                    <PretextBlock text="For deposits and withdrawals only. Your Synthesis wallet handles trading." font={PRETEXT_FONT_TINY} lineHeight={15}>
+                      <p className="text-[10px] text-s-muted mb-3">For deposits and withdrawals only. Your Synthesis wallet handles trading.</p>
+                    </PretextBlock>
                     {metaMask.connected ? (
                       <div className="space-y-3">
                         <div className="flex items-center gap-2">
@@ -2091,7 +2123,7 @@ export default function App() {
 
         {/* Opseeq Console Panel */}
         {opseeqPanel && (
-          <div className="fixed top-12 bottom-0 w-[560px] bg-s-surface border-l border-s-border z-30 flex flex-col" style={{ right: chatOpen ? '360px' : '0px' }}>
+          <div data-synth-id="opseeq-console" className="fixed top-12 bottom-0 w-[560px] bg-s-surface border-l border-s-border z-30 flex flex-col" style={{ right: chatOpen ? '360px' : '0px' }}>
             <div className="flex items-center justify-between px-3 h-10 border-b border-s-border">
               <span className="text-xs font-bold text-s-blue tracking-wider">OPSEEQ GATEWAY</span>
               <div className="flex items-center gap-2">
@@ -2125,42 +2157,37 @@ export default function App() {
                 <button onClick={() => setChatOpen(false)} className="text-s-muted hover:text-s-text text-xs">✕</button>
               </div>
             </div>
-            {/* Thinking stages display */}
+            {/* Opseeq pipeline UX: shimmer while waiting; structured stages + thoughts (no raw think() in chat — server strips) */}
+            {chatLoading && thinkLog.length === 0 && <OpseeqLoadingPulse active />}
             {thinkLog.length > 0 && (
-              <div className="border-b border-s-border/50 bg-s-elevated/30">
-                <div className="flex items-center gap-2 px-3 py-1.5">
-                  <div className="text-[9px] text-s-muted uppercase tracking-wider">Reasoning</div>
-                  <div className="flex flex-wrap gap-1">
-                    {thinkLog.map((t, i) => (
-                      <div key={i} title={t.thought}
-                        className={`text-[9px] px-1 py-0.5 rounded border flex items-center gap-0.5 cursor-help ${STAGE_COLORS[t.stage] || 'text-s-muted'} border-current/30 bg-current/5`}>
-                        <span>{STAGE_ICONS[t.stage] || '◦'}</span>
-                        <span>{t.stage}</span>
-                      </div>
-                    ))}
-                  </div>
-                  {chatLoading && <span className="text-[9px] text-s-accent animate-pulse ml-auto">working...</span>}
-                </div>
-                <div className="max-h-[140px] overflow-y-auto px-3 pb-2 space-y-1">
-                  {thinkLog.map((t, i) => (
-                    <div key={`trace-${i}`} className="rounded border border-s-border/40 bg-s-panel/40 px-2 py-1">
-                      <div className="flex items-center justify-between gap-2 text-[8px] uppercase tracking-wider">
-                        <span className={`${STAGE_COLORS[t.stage] || 'text-s-muted'} font-bold`}>{t.stage}</span>
-                        <span className="text-s-muted font-mono">{ts(t.enteredAt)}</span>
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-s-muted leading-snug">{t.thought}</div>
-                    </div>
-                  ))}
-                </div>
+              <div className="relative">
+                <OpseeqThinkStages stages={thinkLog} />
+                {chatLoading && (
+                  <div className="absolute right-3 top-2 text-[9px] text-s-accent animate-pulse">working…</div>
+                )}
               </div>
             )}
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
               {chatMsgs.length === 0 && (
                 <div className="py-4">
                   <div className="text-xs text-s-muted border-l-2 border-s-accent pl-3 mb-4">
-                    <p className="text-s-text font-semibold mb-1">Welcome to Opseeq</p>
-                    <p>I find the best near-term prediction markets, analyze them with AI, and walk you through placing a prediction.</p>
-                    <p className="mt-1">Balance: <span className="font-mono text-s-accent">${f(bal?.total || '0')}</span> | Markets tracked: <span className="font-mono text-s-accent">{mkts.length}</span></p>
+                    <PretextBlock
+                      text={'Welcome to Opseeq\n\nI find the best near-term prediction markets, analyze them with AI, and walk you through placing a prediction.'}
+                      font={PRETEXT_FONT_SMALL}
+                      lineHeight={16}
+                      whiteSpace="pre-wrap"
+                    >
+                      <p className="text-s-text font-semibold mb-1">Welcome to Opseeq</p>
+                      <p>I find the best near-term prediction markets, analyze them with AI, and walk you through placing a prediction.</p>
+                    </PretextBlock>
+                    <PretextBlock
+                      text={`Balance: $${f(bal?.total || '0')} | Markets tracked: ${mkts.length}`}
+                      font={PRETEXT_FONT_SMALL}
+                      lineHeight={16}
+                      className="mt-1"
+                    >
+                      <p className="mt-1">Balance: <span className="font-mono text-s-accent">${f(bal?.total || '0')}</span> | Markets tracked: <span className="font-mono text-s-accent">{mkts.length}</span></p>
+                    </PretextBlock>
                   </div>
                   <p className="text-[10px] text-s-muted mb-2 px-1">Quick actions:</p>
                   <div className="space-y-1.5">
@@ -2176,8 +2203,10 @@ export default function App() {
                       <button key={label} onClick={() => sendChat(label)}
                         title={hint}
                         className="block w-full text-left text-xs bg-s-panel border border-s-border rounded px-3 py-2.5 text-s-muted hover:text-s-text hover:border-s-accent transition-colors">
-                        <span>{label}</span>
-                        <span className="block text-[10px] text-s-muted/60 mt-0.5">{hint}</span>
+                        <PretextBlock text={`${label}\n${hint}`} font={PRETEXT_FONT_SMALL} lineHeight={16} whiteSpace="pre-wrap">
+                          <span>{label}</span>
+                          <span className="block text-[10px] text-s-muted/60 mt-0.5">{hint}</span>
+                        </PretextBlock>
                       </button>
                     ))}
                   </div>
@@ -2185,7 +2214,22 @@ export default function App() {
               )}
               {chatMsgs.map((m, i) => (
                 <div key={i} className={`text-xs leading-relaxed ${m.role === 'user' ? 'text-s-text bg-s-panel rounded-lg p-2.5' : 'text-s-muted border-l-2 border-s-accent pl-3 py-1'}`}>
-                  {m.role === 'assistant' ? <div className="whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: m.content.replace(/\*\*(.*?)\*\*/g, '<strong class="text-s-text">$1</strong>').replace(/`(.*?)`/g, '<code class="bg-s-elevated px-1 rounded text-s-accent">$1</code>') }} /> : m.content}
+                  {m.role === 'assistant' ? (
+                    <PretextBlock text={plainFromAssistantMarkdown(m.content)} font={PRETEXT_FONT_SMALL} lineHeight={16} className="text-s-muted">
+                      <div
+                        className="whitespace-pre-wrap"
+                        dangerouslySetInnerHTML={{
+                          __html: m.content
+                            .replace(/\*\*(.*?)\*\*/g, '<strong class="text-s-text">$1</strong>')
+                            .replace(/`(.*?)`/g, '<code class="bg-s-elevated px-1 rounded text-s-accent">$1</code>'),
+                        }}
+                      />
+                    </PretextBlock>
+                  ) : (
+                    <PretextBlock text={m.content} font={PRETEXT_FONT_SMALL} lineHeight={16}>
+                      <span className="whitespace-pre-wrap text-s-text">{m.content}</span>
+                    </PretextBlock>
+                  )}
                 </div>
               ))}
               {chatLoading && (

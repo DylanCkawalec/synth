@@ -1,0 +1,243 @@
+/**
+ * Synth × Mermaid-GPT visual language (distilled from mermaid/public/css/mermaid-gpt.css)
+ * — Scoped to .synth-desk for the main app. Synth palette (#00d4aa accent, s-* surfaces) preserved.
+ * — No component renames; enhances via layering, blur, motion, and focus affordances.
+ */
+
+/* Boot landing — same ambient mesh as the desk (Mermaid-style terminal depth) */
+.sfx-mesh {
+  position: relative;
+  isolation: isolate;
+}
+.sfx-mesh::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 90% 48% at 50% -18%, rgba(0, 212, 170, 0.08), transparent 55%),
+    radial-gradient(ellipse 55% 42% at 100% 0%, rgba(59, 130, 246, 0.06), transparent 50%);
+}
+.sfx-mesh > * {
+  position: relative;
+  z-index: 1;
+}
+
+.synth-desk {
+  --sfx-transition: 0.15s ease;
+  --sfx-transition-slow: 0.25s ease;
+  --sfx-accent: #00d4aa;
+  --sfx-accent-subtle: rgba(0, 212, 170, 0.1);
+  --sfx-accent-dim: rgba(0, 212, 170, 0.2);
+  --sfx-glass-header: rgba(18, 21, 28, 0.88);
+  --sfx-glass-strip: rgba(18, 21, 28, 0.86);
+  --sfx-glass-panel: rgba(18, 21, 28, 0.92);
+  --sfx-border-soft: rgba(255, 255, 255, 0.06);
+  --sfx-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  position: relative;
+  isolation: isolate;
+  min-height: 100vh;
+}
+
+html[data-theme='light'] .synth-desk {
+  --sfx-glass-header: rgba(248, 250, 252, 0.9);
+  --sfx-glass-strip: rgba(248, 250, 252, 0.88);
+  --sfx-glass-panel: rgba(255, 255, 255, 0.94);
+  --sfx-border-soft: rgba(15, 23, 42, 0.08);
+  --sfx-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+}
+
+/* Ambient mesh (Mermaid terminal depth, tinted to Synth accent) */
+.synth-desk::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 90% 48% at 50% -18%, rgba(0, 212, 170, 0.075), transparent 55%),
+    radial-gradient(ellipse 55% 42% at 100% 0%, rgba(59, 130, 246, 0.055), transparent 50%),
+    radial-gradient(ellipse 45% 35% at 0% 100%, rgba(0, 212, 170, 0.04), transparent 45%);
+}
+
+html[data-theme='light'] .synth-desk::before {
+  background:
+    radial-gradient(ellipse 90% 48% at 50% -18%, rgba(0, 212, 170, 0.1), transparent 55%),
+    radial-gradient(ellipse 55% 42% at 100% 0%, rgba(59, 130, 246, 0.07), transparent 50%);
+}
+
+.synth-desk > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Scrollbars — Mermaid-GPT tight rails */
+.synth-desk ::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.synth-desk ::-webkit-scrollbar-track {
+  background: transparent;
+}
+.synth-desk ::-webkit-scrollbar-thumb {
+  background: #2a2f3e;
+  border-radius: 2px;
+}
+.synth-desk ::-webkit-scrollbar-thumb:hover {
+  background: #3d4456;
+}
+
+.synth-desk ::selection {
+  background: rgba(0, 212, 170, 0.22);
+  color: inherit;
+}
+
+/* Sticky glass chrome (cf. .top-bar in mermaid-gpt.css) */
+.synth-desk header {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--sfx-glass-header) !important;
+  border-bottom-color: var(--sfx-border-soft) !important;
+  box-shadow: var(--sfx-inset), 0 4px 24px rgba(0, 0, 0, 0.2);
+}
+
+.synth-desk [data-synth-id='wallet-strip'] {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  background: var(--sfx-glass-strip) !important;
+  border-bottom-color: var(--sfx-border-soft) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+/* Docked panels — depth + glass */
+.synth-desk [data-synth-id='chat-panel'],
+.synth-desk [data-synth-id='opseeq-console'] {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  background: var(--sfx-glass-panel) !important;
+  border-left-color: var(--sfx-border-soft) !important;
+  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.28);
+}
+
+.synth-desk [data-synth-id^='prediction-'] {
+  transition:
+    box-shadow var(--sfx-transition-slow),
+    border-color var(--sfx-transition-slow),
+    transform var(--sfx-transition);
+}
+.synth-desk [data-synth-id^='prediction-']:hover {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35), var(--sfx-inset);
+  transform: translateY(-1px);
+}
+
+/* Commit modal shell — stronger stack shadow */
+.synth-desk .shadow-2xl.rounded-2xl {
+  box-shadow:
+    0 28px 64px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+/* Interactive affordances (Mermaid mode buttons / sidebar-item feel) */
+.synth-desk button {
+  transition:
+    background-color var(--sfx-transition),
+    border-color var(--sfx-transition),
+    color var(--sfx-transition),
+    box-shadow var(--sfx-transition),
+    transform 0.12s ease,
+    filter var(--sfx-transition);
+}
+.synth-desk button:active:not(:disabled) {
+  transform: scale(0.985);
+}
+.synth-desk button:focus-visible {
+  outline: 1px solid var(--sfx-accent-dim);
+  outline-offset: 2px;
+}
+
+.synth-desk input:focus-visible,
+.synth-desk textarea:focus-visible,
+.synth-desk select:focus-visible {
+  outline: 1px solid rgba(0, 212, 170, 0.55);
+  outline-offset: 1px;
+}
+
+.synth-desk main {
+  scroll-behavior: smooth;
+}
+
+/* Toast — soft glow on accent border */
+.synth-desk main > div.fixed.top-14 {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(0, 212, 170, 0.15);
+}
+
+/* ── Tab scenes & surfaces (Mermaid card / shell depth) ─────────────────── */
+.synth-desk main.sfx-main {
+  position: relative;
+}
+
+.sfx-scene {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 0;
+  width: 100%;
+}
+
+.sfx-surface {
+  border-radius: 12px;
+  box-shadow: var(--sfx-inset), 0 6px 28px rgba(0, 0, 0, 0.22);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.sfx-surface:hover {
+  box-shadow: var(--sfx-inset), 0 8px 32px rgba(0, 0, 0, 0.28);
+}
+
+.sfx-island {
+  border-radius: 12px;
+  box-shadow: var(--sfx-inset), 0 4px 22px rgba(0, 0, 0, 0.2);
+  transition: box-shadow 0.2s ease;
+}
+
+.sfx-island:hover {
+  box-shadow: var(--sfx-inset), 0 6px 28px rgba(0, 0, 0, 0.26);
+}
+
+/* KPI strip — subtle raised rail */
+.sfx-kpi-strip {
+  box-shadow: var(--sfx-inset), 0 2px 16px rgba(0, 0, 0, 0.18);
+}
+
+/* Header tab rail — Mermaid mode-selector cousin */
+.synth-desk header nav.sfx-nav {
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.38);
+  border-radius: 10px;
+  border: 1px solid var(--sfx-border-soft);
+  gap: 2px;
+}
+
+html[data-theme='light'] .synth-desk header nav.sfx-nav {
+  background: rgba(255, 255, 255, 0.55);
+  border-color: var(--sfx-border-soft);
+}
+
+.synth-desk header nav.sfx-nav button:active {
+  transform: scale(0.98);
+}
+
+/* Dense tables — row hover + header separation */
+.synth-desk .sfx-table-wrap table tbody tr {
+  transition: background-color var(--sfx-transition);
+}
+.synth-desk .sfx-table-wrap table tbody tr:hover {
+  background: rgba(0, 212, 170, 0.04);
+}
+
+/* Settings sub-tab strip */
+.synth-desk .sfx-settings-tabs {
+  box-shadow: var(--sfx-inset), 0 2px 12px rgba(0, 0, 0, 0.15);
+}
